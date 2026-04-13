@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Video Compressor Tool - GUI Version
-A modern graphical interface for the video compression tool.
+A modern graphical interface for the video compression tool with robust transcript generation.
 """
 
 import os
@@ -11,13 +11,15 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 import ffmpeg
+import speech_recognition as sr
+import tempfile
 
 
 class VideoCompressorGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("🎬 Video Compressor Tool")
-        self.root.geometry("900x800")
+        self.root.geometry("900x900")
         self.root.resizable(True, True)
         
         # Set theme and styling
@@ -33,6 +35,11 @@ class VideoCompressorGUI:
         self.audio_codec = tk.StringVar(value="aac")
         self.audio_bitrate = tk.StringVar(value="128k")
         self.resize_video = tk.BooleanVar(value=False)
+        
+        # Transcript variables
+        self.generate_transcript = tk.BooleanVar(value=False)
+        self.transcript_file = tk.StringVar()
+        self.transcript_language = tk.StringVar(value="en-US")
         
         # Create GUI
         self.create_widgets()
@@ -107,14 +114,17 @@ class VideoCompressorGUI:
         # Audio Settings Section - Rows 13-16
         self.create_audio_section(scrollable_frame, 13)
         
-        # Progress and Log Section - Rows 17-21
-        self.create_progress_section(scrollable_frame, 17)
+        # Transcript Section - Rows 17-20
+        self.create_transcript_section(scrollable_frame, 17)
         
-        # Control Buttons - Row 22
-        self.create_control_buttons(scrollable_frame, 22)
+        # Progress and Log Section - Rows 21-25
+        self.create_progress_section(scrollable_frame, 21)
         
-        # Status Bar - Row 23
-        self.create_status_bar(scrollable_frame, 23)
+        # Control Buttons - Row 26
+        self.create_control_buttons(scrollable_frame, 26)
+        
+        # Status Bar - Row 27
+        self.create_status_bar(scrollable_frame, 27)
         
         # Pack the canvas and scrollbar
         main_canvas.pack(side="left", fill="both", expand=True, padx=20, pady=20)
@@ -209,23 +219,17 @@ class VideoCompressorGUI:
         res_frame.grid(row=row+2, column=1, sticky=tk.W, padx=(0, 15), pady=(0, 15))
         
         ttk.Label(res_frame, text="Width:", font=('Arial', 11)).pack(side=tk.LEFT)
-        width_entry = ttk.Entry(res_frame, textvariable=self.resolution_width, width=10, font=('Arial', 10))
+        width_entry = ttk.Entry(res_frame, textvariable=self.resolution_width, width=8, font=('Arial', 10))
         width_entry.pack(side=tk.LEFT, padx=(8, 15))
         
         ttk.Label(res_frame, text="Height:", font=('Arial', 11)).pack(side=tk.LEFT)
-        height_entry = ttk.Entry(res_frame, textvariable=self.resolution_height, width=10, font=('Arial', 10))
+        height_entry = ttk.Entry(res_frame, textvariable=self.resolution_height, width=8, font=('Arial', 10))
         height_entry.pack(side=tk.LEFT, padx=(8, 0))
         
-        # Common resolutions - Row 11
-        res_buttons_frame = ttk.Frame(parent)
-        res_buttons_frame.grid(row=row+3, column=1, sticky=tk.W, padx=(0, 15), pady=(0, 20))
-        
-        ttk.Button(res_buttons_frame, text="720p", width=8,
-                  command=lambda: self.set_resolution(1280, 720)).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(res_buttons_frame, text="480p", width=8,
-                  command=lambda: self.set_resolution(854, 480)).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(res_buttons_frame, text="360p", width=8,
-                  command=lambda: self.set_resolution(640, 360)).pack(side=tk.LEFT)
+        # Resolution info - Row 11
+        res_info = ttk.Label(parent, text="Common: 1920x1080 (1080p), 1280x720 (720p), 854x480 (480p)", 
+                            style='Info.TLabel')
+        res_info.grid(row=row+3, column=1, sticky=tk.W, padx=(0, 15), pady=(0, 20))
         
         # Initially disable resolution inputs
         self.toggle_resolution_inputs()
@@ -238,39 +242,71 @@ class VideoCompressorGUI:
         
         # Audio codec - Row 14
         ttk.Label(parent, text="Audio Codec:", font=('Arial', 11)).grid(
-            row=row+1, column=0, sticky=tk.W, padx=(20, 15), pady=(0, 15))
-        codec_combo = ttk.Combobox(parent, textvariable=self.audio_codec,
+            row=row+1, column=0, sticky=tk.W, padx=(20, 15), pady=(0, 10))
+        codec_combo = ttk.Combobox(parent, textvariable=self.audio_codec, 
                                    values=['aac', 'mp3', 'opus', 'vorbis'],
                                    state='readonly', width=20, font=('Arial', 10))
-        codec_combo.grid(row=row+1, column=1, sticky=tk.W, padx=(0, 15), pady=(0, 15))
+        codec_combo.grid(row=row+1, column=1, sticky=tk.W, padx=(0, 15), pady=(0, 10))
         
         # Audio bitrate - Row 15
         ttk.Label(parent, text="Audio Bitrate:", font=('Arial', 11)).grid(
             row=row+2, column=0, sticky=tk.W, padx=(20, 15), pady=(0, 20))
-        bitrate_combo = ttk.Combobox(parent, textvariable=self.audio_bitrate,
+        bitrate_combo = ttk.Combobox(parent, textvariable=self.audio_bitrate, 
                                      values=['64k', '96k', '128k', '192k', '256k'],
                                      state='readonly', width=20, font=('Arial', 10))
         bitrate_combo.grid(row=row+2, column=1, sticky=tk.W, padx=(0, 15), pady=(0, 20))
     
+    def create_transcript_section(self, parent, row):
+        """Create transcript settings section."""
+        # Section header - Row 17
+        transcript_header = ttk.Label(parent, text="🗣️ Transcript Settings", style='Header.TLabel')
+        transcript_header.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 15), padx=20)
+        
+        # Transcript checkbox - Row 18
+        transcript_check = ttk.Checkbutton(parent, text="Generate Transcript", 
+                                          variable=self.generate_transcript,
+                                          command=self.toggle_transcript_inputs,
+                                          style='Custom.TCheckbutton')
+        transcript_check.grid(row=row+1, column=0, sticky=tk.W, padx=(20, 15), pady=(0, 15))
+        
+        # Transcript file - Row 19
+        ttk.Label(parent, text="Transcript File:", font=('Arial', 11)).grid(
+            row=row+2, column=0, sticky=tk.W, padx=(20, 15), pady=(0, 10))
+        transcript_entry = ttk.Entry(parent, textvariable=self.transcript_file, width=40, font=('Arial', 10))
+        transcript_entry.grid(row=row+2, column=1, sticky=(tk.W, tk.E), padx=(0, 15), pady=(0, 10))
+        ttk.Button(parent, text="Browse", command=self.browse_transcript_file, width=12).grid(
+            row=row+2, column=2, padx=(0, 20), pady=(0, 10))
+        
+        # Language selection - Row 20
+        ttk.Label(parent, text="Language:", font=('Arial', 11)).grid(
+            row=row+3, column=0, sticky=tk.W, padx=(20, 15), pady=(0, 20))
+        language_combo = ttk.Combobox(parent, textvariable=self.transcript_language,
+                                     values=['en-US', 'en-GB', 'es-ES', 'fr-FR', 'de-DE', 'ja-JP', 'zh-CN'],
+                                     state='readonly', width=20, font=('Arial', 10))
+        language_combo.grid(row=row+3, column=1, sticky=tk.W, padx=(0, 15), pady=(0, 20))
+        
+        # Initially disable transcript inputs
+        self.toggle_transcript_inputs()
+    
     def create_progress_section(self, parent, row):
         """Create progress and log section."""
-        # Section header - Row 17
+        # Section header - Row 21
         progress_header = ttk.Label(parent, text="📊 Progress & Log", style='Header.TLabel')
         progress_header.grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(0, 15), padx=20)
         
-        # Progress bar - Row 18
+        # Progress bar - Row 22
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(parent, variable=self.progress_var, 
-                                           maximum=100, length=500)
+                                           maximum=100, length=400)
         self.progress_bar.grid(row=row+1, column=0, columnspan=3, sticky=(tk.W, tk.E), 
                               padx=20, pady=(0, 15))
         
-        # Log text area - Row 19
+        # Log text area - Row 23
         self.log_text = scrolledtext.ScrolledText(parent, height=10, width=80, font=('Consolas', 9))
         self.log_text.grid(row=row+2, column=0, columnspan=3, sticky=(tk.W, tk.E), 
                           padx=20, pady=(0, 15))
         
-        # Clear log button - Row 20
+        # Clear log button - Row 24
         ttk.Button(parent, text="Clear Log", command=self.clear_log, width=12).grid(
             row=row+3, column=0, sticky=tk.W, padx=20, pady=(0, 20))
     
@@ -279,61 +315,24 @@ class VideoCompressorGUI:
         button_frame = ttk.Frame(parent)
         button_frame.grid(row=row, column=0, columnspan=3, pady=20)
         
-        # Compress button
         self.compress_button = ttk.Button(button_frame, text="🚀 Start Compression", 
-                                         style='Success.TButton',
-                                         command=self.start_compression,
-                                         width=20)
+                                         command=self.start_compression, style='Primary.TButton')
         self.compress_button.pack(side=tk.LEFT, padx=(0, 15))
         
-        # Stop button
         self.stop_button = ttk.Button(button_frame, text="⏹️ Stop", 
-                                     style='Warning.TButton',
-                                     command=self.stop_compression,
-                                     state=tk.DISABLED,
-                                     width=15)
+                                     command=self.stop_compression, style='Warning.TButton', state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=(0, 15))
         
-        # Reset button
-        ttk.Button(button_frame, text="🔄 Reset", command=self.reset_form, width=15).pack(side=tk.LEFT)
+        reset_button = ttk.Button(button_frame, text="🔄 Reset", 
+                                 command=self.reset_form, style='Success.TButton')
+        reset_button.pack(side=tk.LEFT)
     
     def create_status_bar(self, parent, row):
         """Create status bar."""
         self.status_var = tk.StringVar(value="Ready")
-        status_bar = ttk.Label(parent, textvariable=self.status_var, 
-                              relief=tk.SUNKEN, anchor=tk.W, font=('Arial', 10))
-        status_bar.grid(row=row, column=0, columnspan=3, sticky=(tk.W, tk.E), 
-                       padx=20, pady=(20, 0))
-    
-    def browse_input_file(self):
-        """Browse for input video file."""
-        filetypes = [
-            ("Video files", "*.mp4 *.avi *.mov *.wmv *.flv *.mkv *.webm *.m4v *.3gp *.mpg *.mpeg"),
-            ("All files", "*.*")
-        ]
-        filename = filedialog.askopenfilename(title="Select Input Video", filetypes=filetypes)
-        if filename:
-            self.input_file.set(filename)
-            # Auto-generate output filename
-            self.auto_generate_output_name(filename)
-    
-    def browse_output_file(self):
-        """Browse for output file location."""
-        filetypes = [
-            ("MP4 files", "*.mp4"),
-            ("All files", "*.*")
-        ]
-        filename = filedialog.asksaveasfilename(title="Save Compressed Video As", 
-                                              filetypes=filetypes, defaultextension=".mp4")
-        if filename:
-            self.output_file.set(filename)
-    
-    def auto_generate_output_name(self, input_path):
-        """Auto-generate output filename based on input."""
-        input_path = Path(input_path)
-        output_name = f"{input_path.stem}_compressed{input_path.suffix}"
-        output_path = input_path.parent / output_name
-        self.output_file.set(str(output_path))
+        status_label = ttk.Label(parent, textvariable=self.status_var, 
+                                font=('Arial', 10), foreground='#7f8c8d')
+        status_label.grid(row=row, column=0, columnspan=3, sticky=tk.W, padx=20, pady=(0, 20))
     
     def toggle_resolution_inputs(self):
         """Enable/disable resolution input fields."""
@@ -344,19 +343,69 @@ class VideoCompressorGUI:
             self.resolution_width.set("")
             self.resolution_height.set("")
     
-    def set_resolution(self, width, height):
-        """Set resolution values."""
-        self.resize_video.set(True)
-        self.resolution_width.set(str(width))
-        self.resolution_height.set(str(height))
+    def toggle_transcript_inputs(self):
+        """Enable/disable transcript input fields."""
+        if self.generate_transcript.get():
+            # Auto-generate transcript filename based on output video
+            output_file = self.output_file.get()
+            if output_file:
+                base_name = os.path.splitext(output_file)[0]
+                self.transcript_file.set(f"{base_name}_transcript.txt")
+        else:
+            self.transcript_file.set("")
+    
+    def browse_input_file(self):
+        """Browse for input video file."""
+        filetypes = [
+            ("Video files", "*.mp4 *.avi *.mov *.mkv *.wmv *.flv"),
+            ("All files", "*.*")
+        ]
+        filename = filedialog.askopenfilename(title="Select Input Video", filetypes=filetypes)
+        if filename:
+            self.input_file.set(filename)
+            # Auto-generate output filename
+            base_name = os.path.splitext(filename)[0]
+            self.output_file.set(f"{base_name}_compressed.mp4")
+            # Auto-generate transcript filename if enabled
+            if self.generate_transcript.get():
+                self.transcript_file.set(f"{base_name}_transcript.txt")
+    
+    def browse_output_file(self):
+        """Browse for output video file."""
+        filetypes = [
+            ("MP4 files", "*.mp4"),
+            ("All files", "*.*")
+        ]
+        filename = filedialog.asksaveasfilename(title="Save Compressed Video As", 
+                                              filetypes=filetypes, defaultextension=".mp4")
+        if filename:
+            self.output_file.set(filename)
+            # Auto-generate transcript filename if enabled
+            if self.generate_transcript.get():
+                base_name = os.path.splitext(filename)[0]
+                self.transcript_file.set(f"{base_name}_transcript.txt")
+    
+    def browse_transcript_file(self):
+        """Browse for transcript file location."""
+        filetypes = [
+            ("Text files", "*.txt"),
+            ("All files", "*.*")
+        ]
+        filename = filedialog.asksaveasfilename(title="Save Transcript As", 
+                                              filetypes=filetypes, defaultextension=".txt")
+        if filename:
+            self.transcript_file.set(filename)
     
     def clear_log(self):
         """Clear the log text area."""
         self.log_text.delete(1.0, tk.END)
     
     def log_message(self, message):
-        """Add message to log."""
-        self.log_text.insert(tk.END, f"{message}\n")
+        """Add message to log with timestamp."""
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+        self.log_text.insert(tk.END, log_entry)
         self.log_text.see(tk.END)
         self.root.update_idletasks()
     
@@ -366,62 +415,294 @@ class VideoCompressorGUI:
             import subprocess
             result = subprocess.run(['ffmpeg', '-version'], 
                                   capture_output=True, text=True, check=True)
-            self.status_var.set("FFmpeg: ✅ Available")
-            self.log_message("✅ FFmpeg is available")
+            self.log_message("✅ FFmpeg found and ready")
         except (subprocess.CalledProcessError, FileNotFoundError):
-            self.status_var.set("FFmpeg: ❌ Not Found")
-            self.log_message("❌ FFmpeg not found! Please install FFmpeg first.")
-            messagebox.showerror("FFmpeg Not Found", 
-                               "FFmpeg is not installed or not in PATH.\n\n"
-                               "Please install FFmpeg from https://ffmpeg.org/download.html\n"
-                               "and add it to your system PATH.")
-    
-    def validate_inputs(self):
-        """Validate all input fields."""
-        if not self.input_file.get():
-            messagebox.showerror("Error", "Please select an input video file.")
-            return False
-        
-        if not self.output_file.get():
-            messagebox.showerror("Error", "Please specify an output file.")
-            return False
-        
-        if not os.path.exists(self.input_file.get()):
-            messagebox.showerror("Error", "Input file does not exist.")
-            return False
-        
-        if self.resize_video.get():
-            try:
-                width = int(self.resolution_width.get())
-                height = int(self.resolution_height.get())
-                if width <= 0 or height <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Error", "Please enter valid resolution dimensions.")
-                return False
-        
-        return True
+            self.log_message("❌ FFmpeg not found! Please install FFmpeg and add it to your system PATH.")
+            messagebox.showerror("FFmpeg Error", 
+                               "FFmpeg not found! Please install FFmpeg and add it to your system PATH.\n\n"
+                               "Download from: https://ffmpeg.org/download.html")
     
     def start_compression(self):
         """Start video compression in a separate thread."""
-        if not self.validate_inputs():
+        if not self.input_file.get() or not self.output_file.get():
+            messagebox.showerror("Error", "Please select input and output files.")
             return
         
-        # Disable controls
+        # Validate transcript settings
+        if self.generate_transcript.get() and not self.transcript_file.get():
+            messagebox.showerror("Error", "Please specify a transcript file location.")
+            return
+        
+        # Start compression in separate thread
         self.compress_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self.progress_var.set(0)
         
-        # Start compression thread
-        self.compression_thread = threading.Thread(target=self.compress_video)
-        self.compression_thread.daemon = True
-        self.compression_thread.start()
+        compression_thread = threading.Thread(target=self.compress_video)
+        compression_thread.daemon = True
+        compression_thread.start()
     
     def stop_compression(self):
         """Stop video compression."""
         # This would need to be implemented with FFmpeg process management
         self.log_message("⚠️ Stop functionality not yet implemented")
         self.reset_controls()
+    
+    def create_transcript_from_video(self, input_file, output_file, language='en-US'):
+        """
+        Generate transcript from video file using speech recognition with robust error handling.
+        
+        Args:
+            input_file (str): Path to input video file
+            output_file (str): Path to output transcript file
+            language (str): Language code for speech recognition
+        
+        Returns:
+            str: Generated transcript text or None if failed
+        """
+        
+        if not os.path.exists(input_file):
+            self.log_message(f"❌ Input file not found: {input_file}")
+            return None
+        
+        # Initialize recognizer
+        recognizer = sr.Recognizer()
+        
+        # Create temporary audio file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
+            temp_audio_path = temp_audio.name
+        
+        try:
+            self.log_message(f"🎵 Extracting audio from video...")
+            
+            # Extract audio using FFmpeg with multiple format attempts
+            audio_formats = [
+                # Format 1: Standard WAV with optimal speech recognition parameters
+                {
+                    'acodec': 'pcm_s16le',
+                    'ar': 16000,
+                    'ac': 1,
+                    'f': 'wav',
+                    'loglevel': 'error'
+                },
+                # Format 2: Alternative WAV with different parameters
+                {
+                    'acodec': 'pcm_s16le',
+                    'ar': 22050,
+                    'ac': 1,
+                    'f': 'wav',
+                    'loglevel': 'error'
+                },
+                # Format 3: FLAC format (lossless, often better for recognition)
+                {
+                    'acodec': 'flac',
+                    'ar': 16000,
+                    'ac': 1,
+                    'f': 'flac',
+                    'loglevel': 'error'
+                }
+            ]
+            
+            transcript = None
+            successful_format = None
+            
+            for i, format_params in enumerate(audio_formats):
+                try:
+                    self.log_message(f"🎵 Trying audio format {i+1}...")
+                    
+                    # Extract audio with current format
+                    (
+                        ffmpeg.input(input_file)
+                        .output(temp_audio_path, **format_params)
+                        .overwrite_output()
+                        .run(capture_stdout=True, capture_stderr=True, quiet=True)
+                    )
+                    
+                    # Try to recognize speech with this audio format
+                    transcript = self._recognize_speech(temp_audio_path, language, recognizer)
+                    
+                    if transcript:
+                        successful_format = i + 1
+                        self.log_message(f"✅ Success with audio format {successful_format}")
+                        break
+                    else:
+                        self.log_message(f"⚠️ Audio format {i+1} failed, trying next...")
+                        
+                except Exception as e:
+                    self.log_message(f"⚠️ Audio format {i+1} extraction failed: {e}")
+                    continue
+            
+            if not transcript:
+                self.log_message("❌ All audio formats failed")
+                return None
+            
+            # Save transcript to file
+            output_dir = os.path.dirname(output_file)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            
+            with open(output_file, 'w', encoding='utf-8') as f:
+                f.write(transcript)
+            
+            self.log_message(f"📝 Transcript saved to: {output_file}")
+            return transcript
+            
+        except Exception as e:
+            self.log_message(f"❌ Error during transcript generation: {str(e)}")
+            return None
+        finally:
+            # Clean up temporary audio file
+            if os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
+    
+    def _recognize_speech(self, audio_path, language, recognizer):
+        """
+        Attempt speech recognition with multiple strategies.
+        
+        Args:
+            audio_path (str): Path to audio file
+            language (str): Language code
+            recognizer: Speech recognition recognizer instance
+        
+        Returns:
+            str: Recognized text or None if failed
+        """
+        
+        try:
+            self.log_message(f"🎤 Processing audio for speech recognition...")
+            
+            # Load audio file
+            with sr.AudioFile(audio_path) as source:
+                # Adjust for ambient noise
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                # Record audio
+                audio = recognizer.record(source)
+            
+            self.log_message(f"🔍 Converting speech to text...")
+            
+            # Strategy 1: Try with original language code
+            try:
+                transcript = recognizer.recognize_google(audio, language=language)
+                self.log_message("✅ Speech recognition successful with original language code")
+                return transcript
+            except sr.RequestError as e:
+                self.log_message(f"⚠️ First attempt failed: {e}")
+            
+            # Strategy 2: Try with simplified language code
+            try:
+                if language == 'en-US':
+                    self.log_message("🔄 Retrying with 'en' language code...")
+                    transcript = recognizer.recognize_google(audio, language='en')
+                elif language.startswith('en'):
+                    self.log_message("🔄 Retrying with 'en' language code...")
+                    transcript = recognizer.recognize_google(audio, language='en')
+                else:
+                    base_lang = language.split('-')[0]
+                    self.log_message(f"🔄 Retrying with '{base_lang}' language code...")
+                    transcript = recognizer.recognize_google(audio, language=base_lang)
+                
+                if transcript:
+                    self.log_message("✅ Speech recognition successful with simplified language code")
+                    return transcript
+                    
+            except sr.RequestError as e2:
+                self.log_message(f"⚠️ Second attempt failed: {e2}")
+            
+            # Strategy 3: Try without specifying language (auto-detect)
+            try:
+                self.log_message("🔄 Retrying with auto-language detection...")
+                transcript = recognizer.recognize_google(audio)
+                if transcript:
+                    self.log_message("✅ Speech recognition successful with auto-detection")
+                    return transcript
+            except sr.RequestError as e3:
+                self.log_message(f"⚠️ Third attempt failed: {e3}")
+            
+            # Strategy 4: Try with different audio parameters
+            try:
+                self.log_message("🔄 Retrying with adjusted audio parameters...")
+                # Adjust recognition parameters
+                recognizer.energy_threshold = 300
+                recognizer.dynamic_energy_threshold = True
+                recognizer.pause_threshold = 0.8
+                
+                transcript = recognizer.recognize_google(audio, language='en')
+                if transcript:
+                    self.log_message("✅ Speech recognition successful with adjusted parameters")
+                    return transcript
+            except sr.RequestError as e4:
+                self.log_message(f"⚠️ Fourth attempt failed: {e4}")
+            
+            # Strategy 5: Try chunking the audio for better recognition
+            try:
+                self.log_message("🔄 Retrying with audio chunking...")
+                transcript = self._recognize_chunked_audio(audio_path, language, recognizer)
+                if transcript:
+                    self.log_message("✅ Speech recognition successful with audio chunking")
+                    return transcript
+            except Exception as e5:
+                self.log_message(f"⚠️ Fifth attempt (chunking) failed: {e5}")
+            
+            self.log_message("❌ All recognition strategies failed")
+            return None
+            
+        except sr.UnknownValueError:
+            self.log_message("❌ Speech recognition could not understand the audio")
+            return None
+        except Exception as e:
+            self.log_message(f"❌ Error during speech recognition: {str(e)}")
+            return None
+    
+    def _recognize_chunked_audio(self, audio_path, language, recognizer):
+        """
+        Attempt recognition by splitting audio into smaller chunks.
+        
+        Args:
+            audio_path (str): Path to audio file
+            language (str): Language code
+            recognizer: Speech recognition recognizer instance
+        
+        Returns:
+            str: Recognized text or None if failed
+        """
+        
+        try:
+            # Create a new temporary file for chunked audio
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as chunked_audio:
+                chunked_audio_path = chunked_audio.name
+            
+            try:
+                # Extract audio in smaller chunks (30 seconds each)
+                (
+                    ffmpeg.input(audio_path)
+                    .output(chunked_audio_path, 
+                           acodec='pcm_s16le',
+                           ar=16000,
+                           ac=1,
+                           f='wav',
+                           segment_time=30,
+                           segment_format='wav',
+                           reset_timestamps=1)
+                    .overwrite_output()
+                    .run(capture_stdout=True, capture_stderr=True, quiet=True)
+                )
+                
+                # Try to recognize the chunked audio
+                with sr.AudioFile(chunked_audio_path) as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    audio = recognizer.record(source)
+                
+                transcript = recognizer.recognize_google(audio, language='en')
+                return transcript
+                
+            finally:
+                # Clean up chunked audio file
+                if os.path.exists(chunked_audio_path):
+                    os.unlink(chunked_audio_path)
+                    
+        except Exception as e:
+            self.log_message(f"❌ Audio chunking failed: {e}")
+            return None
     
     def compress_video(self):
         """Compress video using FFmpeg."""
@@ -474,6 +755,20 @@ class VideoCompressorGUI:
             # Show file size comparison
             self.show_file_size_comparison(input_file, output_file)
             
+            # Generate transcript if requested
+            if self.generate_transcript.get():
+                self.log_message("📝 Starting transcript generation...")
+                transcript_file = self.transcript_file.get()
+                language = self.transcript_language.get()
+                
+                transcript = self.create_transcript_from_video(input_file, transcript_file, language)
+                
+                if transcript:
+                    self.log_message("✅ Transcript generation completed successfully!")
+                    self.log_message(f"Transcript preview: {transcript[:100]}...")
+                else:
+                    self.log_message("❌ Transcript generation failed!")
+            
         except ffmpeg.Error as e:
             error_msg = e.stderr.decode() if e.stderr else str(e)
             self.log_message(f"❌ FFmpeg error: {error_msg}")
@@ -517,23 +812,20 @@ class VideoCompressorGUI:
         self.resolution_height.set("")
         self.audio_codec.set("aac")
         self.audio_bitrate.set("128k")
+        self.generate_transcript.set(False)
+        self.transcript_file.set("")
+        self.transcript_language.set("en-US")
         self.progress_var.set(0)
         self.clear_log()
         self.status_var.set("Ready")
         self.toggle_resolution_inputs()
+        self.toggle_transcript_inputs()
 
 
 def main():
     """Main function to run the GUI."""
     root = tk.Tk()
     app = VideoCompressorGUI(root)
-    
-    # Center window on screen
-    root.update_idletasks()
-    x = (root.winfo_screenwidth() // 2) - (root.winfo_width() // 2)
-    y = (root.winfo_screenheight() // 2) - (root.winfo_height() // 2)
-    root.geometry(f"+{x}+{y}")
-    
     root.mainloop()
 
 

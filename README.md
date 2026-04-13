@@ -163,6 +163,21 @@ python video_compressor.py large_video.mp4 web_ready.mp4 --crf 30 --preset ultra
 python video_compressor.py original.mp4 archived.mp4 --crf 20 --preset slow
 ```
 
+### Example 4: Compress video and generate transcript
+```bash
+python video_compressor.py presentation.mp4 compressed.mp4 --transcript transcript.txt --crf 25
+```
+
+### Example 5: Multi-language transcript generation
+```bash
+python video_compressor.py spanish_video.mp4 compressed.mp4 --transcript transcript.txt --language es-ES
+```
+
+### Example 6: Complete workflow (compress + resize + transcript)
+```bash
+python video_compressor.py large_video.mp4 web_ready.mp4 --crf 28 --resolution 1280 720 --transcript transcript.txt
+```
+
 ## 🤝 Contributing
 
 Feel free to submit issues, feature requests, or pull requests to improve this tool!

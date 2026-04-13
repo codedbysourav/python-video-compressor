@@ -1,2 +1,4 @@
 ffmpeg-python>=0.2.0
 pathlib2>=2.3.7; python_version < "3.4"
+SpeechRecognition>=3.10.0
+PyAudio>=0.2.11
