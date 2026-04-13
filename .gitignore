@@ -13,7 +13,7 @@
 *.ts
 *.mts
 *.m2ts
-
+.env
 # Audio Files
 *.mp3
 *.wav

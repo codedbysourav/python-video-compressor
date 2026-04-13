@@ -8,9 +8,35 @@ Also includes transcript generation functionality using speech recognition.
 import os
 import sys
 import argparse
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 import ffmpeg
 import speech_recognition as sr
 import tempfile
+
+
+def load_dotenv_file(dotenv_path='.env'):
+    """Load simple KEY=VALUE pairs from a .env file into process environment."""
+    if not os.path.exists(dotenv_path):
+        return
+
+    try:
+        with open(dotenv_path, 'r', encoding='utf-8') as file_handle:
+            for raw_line in file_handle:
+                line = raw_line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = value
+    except OSError:
+        # The app can still run without .env parsing; environment variables may already exist.
+        return
 
 
 def check_ffmpeg():
@@ -153,6 +179,239 @@ def convert_video_to_audio(input_file, output_file, audio_codec='mp3', audio_bit
     except Exception as e:
         print(f"❌ Unexpected error: {str(e)}")
         return False
+
+
+def merge_videos(input_files, output_file):
+    """
+    Merge multiple video files into one in the given order using FFmpeg concat demuxer.
+
+    Args:
+        input_files (list): Ordered list of input video file paths.
+        output_file (str): Path to the merged output video file.
+
+    Returns:
+        bool: True on success, False on failure.
+    """
+    if not input_files:
+        raise ValueError('No input files provided for merging.')
+
+    for path in input_files:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f'Input file not found: {path}')
+
+    output_dir = os.path.dirname(output_file)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    with tempfile.NamedTemporaryFile(
+        mode='w', suffix='.txt', delete=False, encoding='utf-8'
+    ) as list_file:
+        list_path = list_file.name
+        for path in input_files:
+            # ffmpeg concat list requires forward slashes; escape embedded single quotes
+            safe_path = path.replace('\\', '/').replace("'", r"'\''")
+            list_file.write(f"file '{safe_path}'\n")
+
+    print(f"Merging {len(input_files)} files → {output_file}")
+    try:
+        (
+            ffmpeg
+            .input(list_path, format='concat', safe=0)
+            .output(output_file, c='copy')
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+        print(f'✅ Merge completed: {output_file}')
+        return True
+    except ffmpeg.Error as e:
+        print(f"❌ FFmpeg merge error: {e.stderr.decode() if e.stderr else str(e)}")
+        return False
+    except Exception as e:
+        print(f'❌ Unexpected error during merge: {str(e)}')
+        return False
+    finally:
+        if os.path.exists(list_path):
+            os.unlink(list_path)
+
+
+def save_text_output(output_file, text):
+    """Save text content to a file, creating parent folders when needed."""
+    output_dir = os.path.dirname(output_file)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    with open(output_file, 'w', encoding='utf-8') as file_handle:
+        file_handle.write(text)
+
+
+def _chunk_text(text, max_chars=12000):
+    """Split large text into sentence-friendly chunks for LLM summarization."""
+    stripped_text = text.strip()
+    if not stripped_text:
+        return []
+
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    sentences = stripped_text.replace('\r', '').split('\n')
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        sentence_length = len(sentence) + 1
+        if current_chunk and current_length + sentence_length > max_chars:
+            chunks.append('\n'.join(current_chunk))
+            current_chunk = [sentence]
+            current_length = sentence_length
+        else:
+            current_chunk.append(sentence)
+            current_length += sentence_length
+
+    if current_chunk:
+        chunks.append('\n'.join(current_chunk))
+
+    return chunks
+
+
+def _extract_message_content(message_content):
+    """Normalize Azure OpenAI response content to plain text."""
+    if isinstance(message_content, str):
+        return message_content.strip()
+
+    if isinstance(message_content, list):
+        text_parts = []
+        for item in message_content:
+            if isinstance(item, dict) and item.get('type') == 'text':
+                text_parts.append(item.get('text', ''))
+        return '\n'.join(part for part in text_parts if part).strip()
+
+    return ''
+
+
+def _azure_chat_completion(messages, endpoint, deployment, api_key,
+                           api_version='2024-02-15-preview',
+                           temperature=0.2, max_tokens=700):
+    """Send one chat completion request to Azure OpenAI."""
+    if not endpoint or not deployment or not api_key:
+        raise ValueError('Azure endpoint, deployment, and API key are required for AI summarization.')
+
+    endpoint = endpoint.rstrip('/')
+    deployment_name = urllib.parse.quote(deployment, safe='')
+    api_version_value = urllib.parse.quote(api_version, safe='')
+    url = f"{endpoint}/openai/deployments/{deployment_name}/chat/completions?api-version={api_version_value}"
+
+    payload = {
+        'messages': messages,
+        'temperature': temperature,
+        'max_tokens': max_tokens
+    }
+
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            'Content-Type': 'application/json',
+            'api-key': api_key
+        },
+        method='POST'
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            response_data = json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode('utf-8', errors='replace')
+        raise RuntimeError(f'Azure OpenAI request failed ({exc.code}): {error_body}') from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f'Azure OpenAI connection failed: {exc.reason}') from exc
+
+    try:
+        content = response_data['choices'][0]['message']['content']
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f'Unexpected Azure OpenAI response: {response_data}') from exc
+
+    normalized_content = _extract_message_content(content)
+    if not normalized_content:
+        raise RuntimeError('Azure OpenAI returned an empty summary.')
+
+    return normalized_content
+
+
+def summarize_transcript_with_azure_openai(transcript_text, endpoint, deployment, api_key,
+                                           api_version='2024-02-15-preview'):
+    """
+    Summarize transcript text using Azure OpenAI.
+
+    Large transcripts are summarized in chunks first, then consolidated.
+    """
+    if not transcript_text or not transcript_text.strip():
+        raise ValueError('Transcript text is required for summarization.')
+
+    chunks = _chunk_text(transcript_text)
+    if not chunks:
+        raise ValueError('Transcript text is empty after cleanup.')
+
+    chunk_summaries = []
+    for index, chunk in enumerate(chunks, start=1):
+        chunk_summary = _azure_chat_completion(
+            messages=[
+                {
+                    'role': 'system',
+                    'content': (
+                        'You summarize transcript excerpts accurately. '
+                        'Keep names, numbers, and decisions precise. '
+                        'Return concise prose with short bullet points when useful.'
+                    )
+                },
+                {
+                    'role': 'user',
+                    'content': (
+                        f'Summarize transcript chunk {index} of {len(chunks)}. '
+                        'Capture the main topics, key facts, and action items.\n\n'
+                        f'Transcript:\n{chunk}'
+                    )
+                }
+            ],
+            endpoint=endpoint,
+            deployment=deployment,
+            api_key=api_key,
+            api_version=api_version,
+            temperature=0.1,
+            max_tokens=500
+        )
+        chunk_summaries.append(f'Chunk {index} summary:\n{chunk_summary}')
+
+    if len(chunk_summaries) == 1:
+        return chunk_summaries[0].replace('Chunk 1 summary:\n', '', 1).strip()
+
+    combined_summary_input = '\n\n'.join(chunk_summaries)
+    return _azure_chat_completion(
+        messages=[
+            {
+                'role': 'system',
+                'content': (
+                    'You create clean meeting-style summaries from transcript summaries. '
+                    'Return exactly these sections: Overview, Key Points, Action Items, Open Questions.'
+                )
+            },
+            {
+                'role': 'user',
+                'content': (
+                    'Combine the chunk summaries below into one final summary. '
+                    'Be concise, structured, and factual.\n\n'
+                    f'{combined_summary_input}'
+                )
+            }
+        ],
+        endpoint=endpoint,
+        deployment=deployment,
+        api_key=api_key,
+        api_version=api_version,
+        temperature=0.1,
+        max_tokens=700
+    )
 
 
 def generate_transcript(input_file, output_file=None, language='en-US'):
@@ -366,19 +625,12 @@ def compress_video_with_transcript(input_file, output_file, transcript_file=None
 
 def run_processing_mode(mode, input_file, output_file, transcript_file=None,
                         crf=28, preset='fast', resolution=None,
-                        audio_codec='aac', audio_bitrate='128k', language='en-US'):
+                        audio_codec='aac', audio_bitrate='128k', language='en-US',
+                        summary_file=None, azure_endpoint=None,
+                        azure_deployment=None, azure_api_key=None,
+                        azure_api_version='2024-02-15-preview',
+                        azure_model_name=None):
     """Run one of the supported processing modes."""
-
-    if mode == 'compress':
-        return compress_video(
-            input_file=input_file,
-            output_file=output_file,
-            crf=crf,
-            preset=preset,
-            resolution=resolution,
-            audio_codec=audio_codec,
-            audio_bitrate=audio_bitrate
-        )
 
     if mode == 'audio':
         return convert_video_to_audio(
@@ -388,27 +640,38 @@ def run_processing_mode(mode, input_file, output_file, transcript_file=None,
             audio_bitrate=audio_bitrate
         )
 
-    if mode == 'audio-transcript':
-        print("🎧 Converting video to audio...")
-        audio_success = convert_video_to_audio(
+    if mode == 'transcript':
+        transcript = generate_transcript(
             input_file=input_file,
             output_file=output_file,
-            audio_codec=audio_codec,
-            audio_bitrate=audio_bitrate
-        )
-        if not audio_success:
-            return False
-
-        if not transcript_file:
-            transcript_file = f"{os.path.splitext(output_file)[0]}_transcript.txt"
-
-        print("\n📝 Generating transcript from converted audio...")
-        transcript = generate_transcript(
-            input_file=output_file,
-            output_file=transcript_file,
             language=language
         )
         return transcript is not None
+
+    if mode == 'transcript-summary':
+        transcript = generate_transcript(
+            input_file=input_file,
+            output_file=output_file,
+            language=language
+        )
+        if not transcript:
+            return False
+
+        if not summary_file:
+            summary_file = f"{os.path.splitext(output_file)[0]}_summary.txt"
+
+        summary_text = summarize_transcript_with_azure_openai(
+            transcript_text=transcript,
+            endpoint=azure_endpoint,
+            deployment=azure_deployment,
+            api_key=azure_api_key,
+            api_version=azure_api_version
+        )
+        save_text_output(summary_file, summary_text)
+        if azure_model_name:
+            print(f"🧠 Summary model reference: {azure_model_name}")
+        print(f"🧠 Summary saved to: {summary_file}")
+        return True
 
     print(f"❌ Unsupported mode: {mode}")
     return False
@@ -416,6 +679,7 @@ def run_processing_mode(mode, input_file, output_file, transcript_file=None,
 
 def main():
     """Main function to handle command line arguments and run compression."""
+    load_dotenv_file()
     
     # Check if FFmpeg is available
     if not check_ffmpeg():
@@ -424,37 +688,25 @@ def main():
         sys.exit(1)
     
     parser = argparse.ArgumentParser(
-        description="Video Processor Tool - Compress video, convert to audio, or convert to audio and transcribe",
+        description="Video Processor Tool - Convert video to audio, transcribe video, or transcribe and summarize with Azure OpenAI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # 1) Compress video with default settings
-  python video_compressor.py input.mp4 output.mp4
-  
-  # High compression (larger file size reduction)
-  python video_compressor.py input.mp4 output.mp4 --crf 30 --preset ultrafast
-  
-  # Compress and resize to 720p
-  python video_compressor.py input.mp4 output.mp4 --resolution 1280 720
-  
-  # High quality compression
-  python video_compressor.py input.mp4 output.mp4 --crf 20 --preset slow
-  
-    # 2) Convert video to audio
+    # 1) Convert video to audio
     python video_compressor.py input.mp4 output.mp3 --mode audio --audio-codec mp3
-  
-    # 3) Convert video to audio and then generate transcript
-    python video_compressor.py input.mp4 output.mp3 --mode audio-transcript --transcript transcript.txt
 
-    # Audio + transcript in Spanish
-    python video_compressor.py input.mp4 output.mp3 --mode audio-transcript --transcript transcript.txt --language es-ES
+    # 2) Get transcription from video
+    python video_compressor.py input.mp4 transcript.txt --mode transcript --language en-US
+
+    # 3) Get transcription and summarize with Azure OpenAI
+    python video_compressor.py input.mp4 transcript.txt --mode transcript-summary --summary-output summary.txt --azure-endpoint https://your-resource.openai.azure.com --azure-deployment gpt-4o --azure-api-key YOUR_KEY
         """
     )
     
     parser.add_argument('input', help='Input video file path')
-    parser.add_argument('output', help='Output compressed video file path')
-    parser.add_argument('--mode', default='compress', choices=['compress', 'audio', 'audio-transcript'],
-                       help='Processing mode: compress, audio, or audio-transcript (default: compress)')
+    parser.add_argument('output', help='Primary output path: audio file for audio mode, transcript file for transcript modes')
+    parser.add_argument('--mode', default='audio', choices=['audio', 'transcript', 'transcript-summary'],
+                       help='Processing mode: audio, transcript, or transcript-summary (default: audio)')
     parser.add_argument('--crf', type=int, default=28, choices=range(18, 31),
                        help='Constant Rate Factor (18-30, lower = better quality, default: 28)')
     parser.add_argument('--preset', default='fast', 
@@ -466,6 +718,12 @@ Examples:
     parser.add_argument('--audio-bitrate', default='128k', help='Audio bitrate (default: 128k)')
     parser.add_argument('--transcript', metavar='FILE', help='Generate transcript and save to specified file')
     parser.add_argument('--language', default='en-US', help='Language code for transcript generation (default: en-US)')
+    parser.add_argument('--summary-output', metavar='FILE', help='Summary output file for transcript-summary mode')
+    parser.add_argument('--azure-endpoint', default=os.getenv('AZURE_OPENAI_ENDPOINT'), help='Azure OpenAI endpoint URL')
+    parser.add_argument('--azure-deployment', default=os.getenv('AZURE_OPENAI_DEPLOYMENT'), help='Azure OpenAI deployment name')
+    parser.add_argument('--azure-api-key', default=os.getenv('AZURE_OPENAI_API_KEY'), help='Azure OpenAI API key')
+    parser.add_argument('--azure-api-version', default=os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview'), help='Azure OpenAI API version')
+    parser.add_argument('--azure-model-name', default=os.getenv('AZURE_OPENAI_MODEL_NAME'), help='Azure OpenAI model name reference')
     
     args = parser.parse_args()
     
@@ -474,20 +732,20 @@ Examples:
         print(f"❌ Input file not found: {args.input}")
         sys.exit(1)
     
-    # Validate CRF range
-    if args.crf < 18 or args.crf > 30:
-        print("❌ CRF must be between 18 and 30")
-        sys.exit(1)
-    
-    # Validate resolution if provided
-    if args.resolution:
-        width, height = args.resolution
-        if width <= 0 or height <= 0:
-            print("❌ Resolution dimensions must be positive integers")
-            sys.exit(1)
-    
     print("🎬 Video Processor Tool")
     print("=" * 50)
+
+    if args.mode == 'transcript-summary':
+        missing_settings = []
+        if not args.azure_endpoint:
+            missing_settings.append('azure-endpoint')
+        if not args.azure_deployment:
+            missing_settings.append('azure-deployment')
+        if not args.azure_api_key:
+            missing_settings.append('azure-api-key')
+        if missing_settings:
+            print(f"❌ Missing Azure OpenAI settings: {', '.join(missing_settings)}")
+            sys.exit(1)
 
     success = run_processing_mode(
         mode=args.mode,
@@ -499,16 +757,22 @@ Examples:
         resolution=args.resolution,
         audio_codec=args.audio_codec,
         audio_bitrate=args.audio_bitrate,
-        language=args.language
+        language=args.language,
+        summary_file=args.summary_output,
+        azure_endpoint=args.azure_endpoint,
+        azure_deployment=args.azure_deployment,
+        azure_api_key=args.azure_api_key,
+        azure_api_version=args.azure_api_version,
+        azure_model_name=args.azure_model_name
     )
     
     if success:
-        if args.mode == 'compress':
-            print("\n🎉 Video compression completed successfully!")
-        elif args.mode == 'audio':
+        if args.mode == 'audio':
             print("\n🎉 Video to audio conversion completed successfully!")
+        elif args.mode == 'transcript':
+            print("\n🎉 Video transcription completed successfully!")
         else:
-            print("\n🎉 Video to audio conversion and transcription completed successfully!")
+            print("\n🎉 Video transcription and AI summary completed successfully!")
         sys.exit(0)
     else:
         print("\n💥 Processing failed!")

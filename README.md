@@ -10,6 +10,9 @@ A powerful Python-based video compression tool that uses FFmpeg to compress vide
 - **Audio compression** - Configurable audio codec and bitrate
 - **Progress tracking** - Shows compression statistics and file size reduction
 - **Cross-platform** - Works on Windows, macOS, and Linux
+- **Video to audio export** - Create audio-only output from video files
+- **Video transcription** - Generate transcript text directly from uploaded video
+- **Azure OpenAI summary support** - Summarize transcripts using your own Azure deployment
 
 ## 🚀 Installation
 
@@ -48,6 +51,21 @@ A powerful Python-based video compression tool that uses FFmpeg to compress vide
    ```
 
 ## 📖 Usage
+
+### GUI Workflows
+
+The desktop app now supports these refined workflows:
+
+1. **Convert Video to Audio**
+2. **Transcribe Video**
+3. **Transcribe and Summarize with AI**
+
+For AI summaries, provide your Azure OpenAI settings in the GUI or through environment variables:
+
+- `AZURE_OPENAI_ENDPOINT`
+- `AZURE_OPENAI_DEPLOYMENT`
+- `AZURE_OPENAI_API_VERSION`
+- `AZURE_OPENAI_API_KEY`
 
 ### Basic Usage
 
