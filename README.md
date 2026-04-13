@@ -56,6 +56,19 @@ A powerful Python-based video compression tool that uses FFmpeg to compress vide
 python video_compressor.py input.mp4 output.mp4
 ```
 
+### Processing Modes
+
+```bash
+# 1) Compress the size
+python video_compressor.py input.mp4 output.mp4 --mode compress
+
+# 2) Convert video to audio
+python video_compressor.py input.mp4 output.mp3 --mode audio --audio-codec mp3
+
+# 3) Convert video to audio and then get transcription
+python video_compressor.py input.mp4 output.mp3 --mode audio-transcript --transcript transcript.txt --language en-US
+```
+
 ### Advanced Usage
 
 ```bash
@@ -81,6 +94,64 @@ python video_compressor.py input.mp4 output.mp4 --audio-codec mp3 --audio-bitrat
 | `--resolution` | Target resolution (WIDTH HEIGHT) | Original | Any positive integers |
 | `--audio-codec` | Audio codec | aac | Any FFmpeg audio codec |
 | `--audio-bitrate` | Audio bitrate | 128k | Any valid bitrate |
+| `--mode` | Processing mode | compress | compress, audio, audio-transcript |
+
+## Docker Usage
+
+You can run the CLI fully inside Docker for compression, video-to-audio conversion, and transcription.
+
+### Build the image
+
+```bash
+docker build -t video-compressor .
+```
+
+### Run with Docker
+
+```powershell
+docker run --rm -v ${PWD}:/data -w /data video-compressor input.mp4 output.mp4
+```
+
+```powershell
+docker run --rm -v ${PWD}:/data -w /data video-compressor input.mp4 output.mp3 --mode audio --audio-codec mp3 --audio-bitrate 128k
+```
+
+```powershell
+docker run --rm -v ${PWD}:/data -w /data video-compressor input.mp4 output.mp3 --mode audio-transcript --transcript transcript.txt --language en-US
+```
+
+### Run with Docker Compose
+
+```bash
+docker compose run --rm video-compressor input.mp4 output.mp4
+```
+
+```bash
+docker compose run --rm video-compressor input.mp4 output.mp3 --mode audio-transcript --transcript transcript.txt --language en-US
+```
+
+### SSL Certificate Error During Build
+
+If image build fails with `CERTIFICATE_VERIFY_FAILED`, your network likely uses a corporate TLS proxy.
+
+Use one of these approaches:
+
+```powershell
+$env:PIP_INDEX_URL="https://your-internal-pypi/simple"
+docker compose build
+```
+
+```powershell
+$env:PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org"
+docker compose build
+```
+
+```powershell
+$env:CA_CERT_B64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\path\to\corp-root-ca.crt"))
+docker compose build
+```
+
+Use `docker compose run --rm ...` for this project. `docker compose up -d` is not ideal because this container is a one-shot CLI task, not a long-running service.
 
 ## 🎯 Compression Settings Guide
 

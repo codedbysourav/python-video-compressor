@@ -11,7 +11,6 @@ import argparse
 import ffmpeg
 import speech_recognition as sr
 import tempfile
-from pathlib import Path
 
 
 def check_ffmpeg():
@@ -110,6 +109,52 @@ def compress_video(input_file, output_file, crf=28, preset='fast',
         return False
 
 
+def convert_video_to_audio(input_file, output_file, audio_codec='mp3', audio_bitrate='128k'):
+    """
+    Convert video to audio-only output using FFmpeg.
+
+    Args:
+        input_file (str): Path to input video file
+        output_file (str): Path to output audio file
+        audio_codec (str): Audio codec for output
+        audio_bitrate (str): Audio bitrate
+    """
+
+    if not os.path.exists(input_file):
+        raise FileNotFoundError(f"Input file not found: {input_file}")
+
+    output_dir = os.path.dirname(output_file)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    input_size = get_file_size_mb(input_file)
+    print(f"Input file: {input_file} ({input_size} MB)")
+    print(f"Output audio file: {output_file}")
+    print(f"Audio settings: codec={audio_codec}, bitrate={audio_bitrate}")
+    print("Starting audio conversion...")
+
+    try:
+        (
+            ffmpeg
+            .input(input_file)
+            .output(output_file, vn=None, acodec=audio_codec, ab=audio_bitrate)
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+        )
+
+        output_size = get_file_size_mb(output_file)
+        print("\n✅ Audio conversion completed successfully!")
+        print(f"Output size: {output_size} MB")
+        return True
+
+    except ffmpeg.Error as e:
+        print(f"❌ FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
+        return False
+    except Exception as e:
+        print(f"❌ Unexpected error: {str(e)}")
+        return False
+
+
 def generate_transcript(input_file, output_file=None, language='en-US'):
     """
     Generate transcript from video file using speech recognition with robust error handling.
@@ -128,246 +173,140 @@ def generate_transcript(input_file, output_file=None, language='en-US'):
     
     # Initialize recognizer
     recognizer = sr.Recognizer()
-    
-    # Create temporary audio file
+    recognizer.dynamic_energy_threshold = True
+
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
         temp_audio_path = temp_audio.name
-    
+
     try:
-        print(f"🎵 Extracting audio from video...")
-        
-        # Extract audio using FFmpeg with multiple format attempts
-        audio_formats = [
-            # Format 1: Standard WAV with optimal speech recognition parameters
-            {
-                'acodec': 'pcm_s16le',
-                'ar': 16000,
-                'ac': 1,
-                'f': 'wav',
-                'loglevel': 'error'
-            },
-            # Format 2: Alternative WAV with different parameters
-            {
-                'acodec': 'pcm_s16le',
-                'ar': 22050,
-                'ac': 1,
-                'f': 'wav',
-                'loglevel': 'error'
-            },
-            # Format 3: FLAC format (lossless, often better for recognition)
-            {
-                'acodec': 'flac',
-                'ar': 16000,
-                'ac': 1,
-                'f': 'flac',
-                'loglevel': 'error'
-            }
-        ]
-        
-        transcript = None
-        successful_format = None
-        
-        for i, format_params in enumerate(audio_formats):
-            try:
-                print(f"🎵 Trying audio format {i+1}...")
-                
-                # Extract audio with current format
-                (
-                    ffmpeg.input(input_file)
-                    .output(temp_audio_path, **format_params)
-                    .overwrite_output()
-                    .run(capture_stdout=True, capture_stderr=True, quiet=True)
-                )
-                
-                # Try to recognize speech with this audio format
-                transcript = _recognize_speech(temp_audio_path, language, recognizer)
-                
-                if transcript:
-                    successful_format = i + 1
-                    print(f"✅ Success with audio format {successful_format}")
-                    break
-                else:
-                    print(f"⚠️ Audio format {i+1} failed, trying next...")
-                    
-            except Exception as e:
-                print(f"⚠️ Audio format {i+1} extraction failed: {e}")
-                continue
-        
+        print("🎵 Extracting audio from media...")
+        (
+            ffmpeg
+            .input(input_file)
+            .output(
+                temp_audio_path,
+                acodec='pcm_s16le',
+                ar=16000,
+                ac=1,
+                f='wav',
+                loglevel='error'
+            )
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True, quiet=True)
+        )
+
+        transcript = _transcribe_wav_in_chunks(temp_audio_path, language, recognizer)
         if not transcript:
-            print("❌ All audio formats failed")
+            print("❌ No transcript generated")
             return None
-        
-        # Save transcript to file if output_file is specified
+
         if output_file:
-            # Create output directory if it doesn't exist
             output_dir = os.path.dirname(output_file)
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir)
-            
+
             with open(output_file, 'w', encoding='utf-8') as f:
                 f.write(transcript)
-            
+
             print(f"📝 Transcript saved to: {output_file}")
-        
+
         return transcript
-        
+
     except Exception as e:
         print(f"❌ Error during transcript generation: {str(e)}")
         return None
     finally:
-        # Clean up temporary audio file
         if os.path.exists(temp_audio_path):
             os.unlink(temp_audio_path)
 
 
-def _recognize_speech(audio_path, language, recognizer):
+def _language_candidates(language):
+    """Build ordered language candidates for speech recognition retries."""
+    candidates = []
+    if language:
+        candidates.append(language)
+        if '-' in language:
+            candidates.append(language.split('-')[0])
+    if 'en' not in candidates:
+        candidates.append('en')
+    candidates.append(None)
+
+    # Keep unique order
+    unique_candidates = []
+    for item in candidates:
+        if item not in unique_candidates:
+            unique_candidates.append(item)
+    return unique_candidates
+
+
+def _recognize_chunk(audio_chunk, language, recognizer):
     """
-    Attempt speech recognition with multiple strategies.
+    Attempt speech recognition for one chunk using fallback language candidates.
     
     Args:
-        audio_path (str): Path to audio file
+        audio_chunk: SpeechRecognition AudioData chunk
         language (str): Language code
         recognizer: Speech recognition recognizer instance
     
     Returns:
         str: Recognized text or None if failed
     """
-    
-    try:
-        print(f"🎤 Processing audio for speech recognition...")
-        
-        # Load audio file
-        with sr.AudioFile(audio_path) as source:
-            # Adjust for ambient noise
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            # Record audio
-            audio = recognizer.record(source)
-        
-        print(f"🔍 Converting speech to text...")
-        
-        # Strategy 1: Try with original language code
+    for lang in _language_candidates(language):
         try:
-            transcript = recognizer.recognize_google(audio, language=language)
-            print("✅ Speech recognition successful with original language code")
-            return transcript
+            if lang:
+                return recognizer.recognize_google(audio_chunk, language=lang)
+            return recognizer.recognize_google(audio_chunk)
+        except sr.UnknownValueError:
+            continue
         except sr.RequestError as e:
-            print(f"⚠️ First attempt failed: {e}")
-        
-        # Strategy 2: Try with simplified language code
-        try:
-            if language == 'en-US':
-                print("🔄 Retrying with 'en' language code...")
-                transcript = recognizer.recognize_google(audio, language='en')
-            elif language.startswith('en'):
-                print("🔄 Retrying with 'en' language code...")
-                transcript = recognizer.recognize_google(audio, language='en')
-            else:
-                base_lang = language.split('-')[0]
-                print(f"🔄 Retrying with '{base_lang}' language code...")
-                transcript = recognizer.recognize_google(audio, language=base_lang)
-            
-            if transcript:
-                print("✅ Speech recognition successful with simplified language code")
-                return transcript
-                
-        except sr.RequestError as e2:
-            print(f"⚠️ Second attempt failed: {e2}")
-        
-        # Strategy 3: Try without specifying language (auto-detect)
-        try:
-            print("🔄 Retrying with auto-language detection...")
-            transcript = recognizer.recognize_google(audio)
-            if transcript:
-                print("✅ Speech recognition successful with auto-detection")
-                return transcript
-        except sr.RequestError as e3:
-            print(f"⚠️ Third attempt failed: {e3}")
-        
-        # Strategy 4: Try with different audio parameters
-        try:
-            print("🔄 Retrying with adjusted audio parameters...")
-            # Adjust recognition parameters
-            recognizer.energy_threshold = 300
-            recognizer.dynamic_energy_threshold = True
-            recognizer.pause_threshold = 0.8
-            
-            transcript = recognizer.recognize_google(audio, language='en')
-            if transcript:
-                print("✅ Speech recognition successful with adjusted parameters")
-                return transcript
-        except sr.RequestError as e4:
-            print(f"⚠️ Fourth attempt failed: {e4}")
-        
-        # Strategy 5: Try chunking the audio for better recognition
-        try:
-            print("🔄 Retrying with audio chunking...")
-            transcript = _recognize_chunked_audio(audio_path, language, recognizer)
-            if transcript:
-                print("✅ Speech recognition successful with audio chunking")
-                return transcript
-        except Exception as e5:
-            print(f"⚠️ Fifth attempt (chunking) failed: {e5}")
-        
-        print("❌ All recognition strategies failed")
-        return None
-        
-    except sr.UnknownValueError:
-        print("❌ Speech recognition could not understand the audio")
-        return None
-    except Exception as e:
-        print(f"❌ Error during speech recognition: {str(e)}")
-        return None
+            print(f"⚠️ Recognition request failed for language {lang or 'auto'}: {e}")
+            continue
+    return None
 
 
-def _recognize_chunked_audio(audio_path, language, recognizer):
+def _transcribe_wav_in_chunks(audio_path, language, recognizer, chunk_seconds=30):
     """
-    Attempt recognition by splitting audio into smaller chunks.
+    Transcribe long audio reliably by processing fixed-size chunks.
     
     Args:
         audio_path (str): Path to audio file
         language (str): Language code
         recognizer: Speech recognition recognizer instance
+        chunk_seconds (int): Chunk duration in seconds
     
     Returns:
         str: Recognized text or None if failed
     """
-    
+
+    transcript_parts = []
+
     try:
-        # Create a new temporary file for chunked audio
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as chunked_audio:
-            chunked_audio_path = chunked_audio.name
-        
-        try:
-            # Extract audio in smaller chunks (30 seconds each)
-            (
-                ffmpeg.input(audio_path)
-                .output(chunked_audio_path, 
-                       acodec='pcm_s16le',
-                       ar=16000,
-                       ac=1,
-                       f='wav',
-                       segment_time=30,
-                       segment_format='wav',
-                       reset_timestamps=1)
-                .overwrite_output()
-                .run(capture_stdout=True, capture_stderr=True, quiet=True)
-            )
-            
-            # Try to recognize the chunked audio
-            with sr.AudioFile(chunked_audio_path) as source:
-                recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                audio = recognizer.record(source)
-            
-            transcript = recognizer.recognize_google(audio, language='en')
-            return transcript
-            
-        finally:
-            # Clean up chunked audio file
-            if os.path.exists(chunked_audio_path):
-                os.unlink(chunked_audio_path)
-                
+        print("🎤 Processing audio for speech recognition...")
+        with sr.AudioFile(audio_path) as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.4)
+
+            chunk_number = 1
+            while True:
+                audio_chunk = recognizer.record(source, duration=chunk_seconds)
+                if not audio_chunk.frame_data:
+                    break
+
+                text = _recognize_chunk(audio_chunk, language, recognizer)
+                if text:
+                    transcript_parts.append(text.strip())
+                    print(f"✅ Transcribed chunk {chunk_number}")
+                else:
+                    print(f"⚠️ No speech detected in chunk {chunk_number}")
+
+                chunk_number += 1
+
+        if not transcript_parts:
+            return None
+
+        return " ".join(part for part in transcript_parts if part)
+
     except Exception as e:
-        print(f"❌ Audio chunking failed: {e}")
+        print(f"❌ Audio chunk transcription failed: {e}")
         return None
 
 
@@ -425,6 +364,56 @@ def compress_video_with_transcript(input_file, output_file, transcript_file=None
     return True
 
 
+def run_processing_mode(mode, input_file, output_file, transcript_file=None,
+                        crf=28, preset='fast', resolution=None,
+                        audio_codec='aac', audio_bitrate='128k', language='en-US'):
+    """Run one of the supported processing modes."""
+
+    if mode == 'compress':
+        return compress_video(
+            input_file=input_file,
+            output_file=output_file,
+            crf=crf,
+            preset=preset,
+            resolution=resolution,
+            audio_codec=audio_codec,
+            audio_bitrate=audio_bitrate
+        )
+
+    if mode == 'audio':
+        return convert_video_to_audio(
+            input_file=input_file,
+            output_file=output_file,
+            audio_codec=audio_codec,
+            audio_bitrate=audio_bitrate
+        )
+
+    if mode == 'audio-transcript':
+        print("🎧 Converting video to audio...")
+        audio_success = convert_video_to_audio(
+            input_file=input_file,
+            output_file=output_file,
+            audio_codec=audio_codec,
+            audio_bitrate=audio_bitrate
+        )
+        if not audio_success:
+            return False
+
+        if not transcript_file:
+            transcript_file = f"{os.path.splitext(output_file)[0]}_transcript.txt"
+
+        print("\n📝 Generating transcript from converted audio...")
+        transcript = generate_transcript(
+            input_file=output_file,
+            output_file=transcript_file,
+            language=language
+        )
+        return transcript is not None
+
+    print(f"❌ Unsupported mode: {mode}")
+    return False
+
+
 def main():
     """Main function to handle command line arguments and run compression."""
     
@@ -435,11 +424,11 @@ def main():
         sys.exit(1)
     
     parser = argparse.ArgumentParser(
-        description="Video Compressor Tool - Compress videos using FFmpeg with optional transcript generation",
+        description="Video Processor Tool - Compress video, convert to audio, or convert to audio and transcribe",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic compression with default settings
+    # 1) Compress video with default settings
   python video_compressor.py input.mp4 output.mp4
   
   # High compression (larger file size reduction)
@@ -451,16 +440,21 @@ Examples:
   # High quality compression
   python video_compressor.py input.mp4 output.mp4 --crf 20 --preset slow
   
-  # Compress video and generate transcript
-  python video_compressor.py input.mp4 output.mp4 --transcript transcript.txt
+    # 2) Convert video to audio
+    python video_compressor.py input.mp4 output.mp3 --mode audio --audio-codec mp3
   
-  # Compress video and generate transcript in Spanish
-  python video_compressor.py input.mp4 output.mp4 --transcript transcript.txt --language es-ES
+    # 3) Convert video to audio and then generate transcript
+    python video_compressor.py input.mp4 output.mp3 --mode audio-transcript --transcript transcript.txt
+
+    # Audio + transcript in Spanish
+    python video_compressor.py input.mp4 output.mp3 --mode audio-transcript --transcript transcript.txt --language es-ES
         """
     )
     
     parser.add_argument('input', help='Input video file path')
     parser.add_argument('output', help='Output compressed video file path')
+    parser.add_argument('--mode', default='compress', choices=['compress', 'audio', 'audio-transcript'],
+                       help='Processing mode: compress, audio, or audio-transcript (default: compress)')
     parser.add_argument('--crf', type=int, default=28, choices=range(18, 31),
                        help='Constant Rate Factor (18-30, lower = better quality, default: 28)')
     parser.add_argument('--preset', default='fast', 
@@ -492,11 +486,11 @@ Examples:
             print("❌ Resolution dimensions must be positive integers")
             sys.exit(1)
     
-    print("🎬 Video Compressor Tool")
+    print("🎬 Video Processor Tool")
     print("=" * 50)
-    
-    # Run compression with optional transcript generation
-    success = compress_video_with_transcript(
+
+    success = run_processing_mode(
+        mode=args.mode,
         input_file=args.input,
         output_file=args.output,
         transcript_file=args.transcript,
@@ -509,13 +503,15 @@ Examples:
     )
     
     if success:
-        if args.transcript:
-            print("\n🎉 Video compression and transcript generation completed successfully!")
-        else:
+        if args.mode == 'compress':
             print("\n🎉 Video compression completed successfully!")
+        elif args.mode == 'audio':
+            print("\n🎉 Video to audio conversion completed successfully!")
+        else:
+            print("\n🎉 Video to audio conversion and transcription completed successfully!")
         sys.exit(0)
     else:
-        print("\n💥 Video compression failed!")
+        print("\n💥 Processing failed!")
         sys.exit(1)
 
 
