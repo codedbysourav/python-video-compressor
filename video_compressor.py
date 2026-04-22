@@ -276,7 +276,7 @@ def _chunk_text(text, max_chars=12000):
 
 
 def _extract_message_content(message_content):
-    """Normalize Azure OpenAI response content to plain text."""
+    """Normalize chat completion response content to plain text."""
     if isinstance(message_content, str):
         return message_content.strip()
 
@@ -290,32 +290,102 @@ def _extract_message_content(message_content):
     return ''
 
 
-def _azure_chat_completion(messages, endpoint, deployment, api_key,
-                           api_version='2024-02-15-preview',
-                           temperature=0.2, max_tokens=700):
-    """Send one chat completion request to Azure OpenAI."""
-    if not endpoint or not deployment or not api_key:
-        raise ValueError('Azure endpoint, deployment, and API key are required for AI summarization.')
+AI_PROVIDERS = ('azure', 'openai', 'openai_compatible', 'ollama_local', 'ollama_cloud')
 
-    endpoint = endpoint.rstrip('/')
-    deployment_name = urllib.parse.quote(deployment, safe='')
-    api_version_value = urllib.parse.quote(api_version, safe='')
-    url = f"{endpoint}/openai/deployments/{deployment_name}/chat/completions?api-version={api_version_value}"
+_PROVIDER_DEFAULTS = {
+    'openai':            {'base_url': 'https://api.openai.com/v1',  'model': 'gpt-4o-mini'},
+    'openai_compatible': {'base_url': '',                           'model': ''},
+    'ollama_local':      {'base_url': 'http://localhost:11434/v1',  'model': 'llama3.1'},
+    'ollama_cloud':      {'base_url': 'https://ollama.com/v1',      'model': ''},
+}
+
+
+def resolve_ai_config(provider, base_url=None, model=None, api_key=None,
+                      azure_endpoint=None, azure_deployment=None,
+                      azure_api_version='2024-02-15-preview',
+                      azure_api_key=None):
+    """Build a normalized ai_config dict, filling in preset defaults where needed."""
+    if provider not in AI_PROVIDERS:
+        raise ValueError(f'Unknown AI provider: {provider}. Choose from {AI_PROVIDERS}.')
+
+    if provider == 'azure':
+        return {
+            'provider': 'azure',
+            'azure_endpoint': (azure_endpoint or '').strip(),
+            'azure_deployment': (azure_deployment or '').strip(),
+            'azure_api_version': (azure_api_version or '2024-02-15-preview').strip(),
+            'api_key': (azure_api_key or '').strip(),
+        }
+
+    defaults = _PROVIDER_DEFAULTS[provider]
+    return {
+        'provider': provider,
+        'base_url': (base_url or defaults['base_url']).strip().rstrip('/'),
+        'model': (model or defaults['model']).strip(),
+        'api_key': (api_key or '').strip(),
+    }
+
+
+def _validate_ai_config(ai_config):
+    """Raise ValueError if the config is missing fields required for its provider."""
+    provider = ai_config.get('provider')
+    if provider == 'azure':
+        if not ai_config.get('azure_endpoint') or not ai_config.get('azure_deployment') or not ai_config.get('api_key'):
+            raise ValueError('Azure endpoint, deployment, and API key are required for AI summarization.')
+        return
+
+    if not ai_config.get('base_url'):
+        raise ValueError(f'{provider}: base URL is required.')
+    if not ai_config.get('model'):
+        raise ValueError(f'{provider}: model name is required.')
+    # Ollama local is the only provider that may legitimately have no API key.
+    if provider != 'ollama_local' and not ai_config.get('api_key'):
+        raise ValueError(f'{provider}: API key is required.')
+
+
+def _azure_chat_completion_request(ai_config, payload):
+    endpoint = ai_config['azure_endpoint'].rstrip('/')
+    deployment_name = urllib.parse.quote(ai_config['azure_deployment'], safe='')
+    api_version = urllib.parse.quote(ai_config['azure_api_version'], safe='')
+    url = f"{endpoint}/openai/deployments/{deployment_name}/chat/completions?api-version={api_version}"
+    headers = {
+        'Content-Type': 'application/json',
+        'api-key': ai_config['api_key'],
+    }
+    return url, headers
+
+
+def _openai_compatible_chat_completion_request(ai_config, payload):
+    base_url = ai_config['base_url'].rstrip('/')
+    url = f"{base_url}/chat/completions"
+    payload['model'] = ai_config['model']
+    headers = {'Content-Type': 'application/json'}
+    if ai_config.get('api_key'):
+        headers['Authorization'] = f"Bearer {ai_config['api_key']}"
+    return url, headers
+
+
+def _chat_completion(ai_config, messages, temperature=0.2, max_tokens=700):
+    """Send one chat completion request to the configured provider."""
+    _validate_ai_config(ai_config)
 
     payload = {
         'messages': messages,
         'temperature': temperature,
-        'max_tokens': max_tokens
+        'max_tokens': max_tokens,
     }
+
+    provider = ai_config['provider']
+    if provider == 'azure':
+        url, headers = _azure_chat_completion_request(ai_config, payload)
+    else:
+        url, headers = _openai_compatible_chat_completion_request(ai_config, payload)
 
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode('utf-8'),
-        headers={
-            'Content-Type': 'application/json',
-            'api-key': api_key
-        },
-        method='POST'
+        headers=headers,
+        method='POST',
     )
 
     try:
@@ -323,26 +393,25 @@ def _azure_chat_completion(messages, endpoint, deployment, api_key,
             response_data = json.loads(response.read().decode('utf-8'))
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode('utf-8', errors='replace')
-        raise RuntimeError(f'Azure OpenAI request failed ({exc.code}): {error_body}') from exc
+        raise RuntimeError(f'{provider} request failed ({exc.code}): {error_body}') from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f'Azure OpenAI connection failed: {exc.reason}') from exc
+        raise RuntimeError(f'{provider} connection failed: {exc.reason}') from exc
 
     try:
         content = response_data['choices'][0]['message']['content']
     except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f'Unexpected Azure OpenAI response: {response_data}') from exc
+        raise RuntimeError(f'Unexpected {provider} response: {response_data}') from exc
 
     normalized_content = _extract_message_content(content)
     if not normalized_content:
-        raise RuntimeError('Azure OpenAI returned an empty summary.')
+        raise RuntimeError(f'{provider} returned an empty summary.')
 
     return normalized_content
 
 
-def summarize_transcript_with_azure_openai(transcript_text, endpoint, deployment, api_key,
-                                           api_version='2024-02-15-preview'):
+def summarize_transcript(transcript_text, ai_config):
     """
-    Summarize transcript text using Azure OpenAI.
+    Summarize transcript text using the configured AI provider.
 
     Large transcripts are summarized in chunks first, then consolidated.
     """
@@ -355,7 +424,8 @@ def summarize_transcript_with_azure_openai(transcript_text, endpoint, deployment
 
     chunk_summaries = []
     for index, chunk in enumerate(chunks, start=1):
-        chunk_summary = _azure_chat_completion(
+        chunk_summary = _chat_completion(
+            ai_config=ai_config,
             messages=[
                 {
                     'role': 'system',
@@ -374,12 +444,8 @@ def summarize_transcript_with_azure_openai(transcript_text, endpoint, deployment
                     )
                 }
             ],
-            endpoint=endpoint,
-            deployment=deployment,
-            api_key=api_key,
-            api_version=api_version,
             temperature=0.1,
-            max_tokens=500
+            max_tokens=500,
         )
         chunk_summaries.append(f'Chunk {index} summary:\n{chunk_summary}')
 
@@ -387,7 +453,8 @@ def summarize_transcript_with_azure_openai(transcript_text, endpoint, deployment
         return chunk_summaries[0].replace('Chunk 1 summary:\n', '', 1).strip()
 
     combined_summary_input = '\n\n'.join(chunk_summaries)
-    return _azure_chat_completion(
+    return _chat_completion(
+        ai_config=ai_config,
         messages=[
             {
                 'role': 'system',
@@ -405,13 +472,22 @@ def summarize_transcript_with_azure_openai(transcript_text, endpoint, deployment
                 )
             }
         ],
-        endpoint=endpoint,
-        deployment=deployment,
-        api_key=api_key,
-        api_version=api_version,
         temperature=0.1,
-        max_tokens=700
+        max_tokens=700,
     )
+
+
+def summarize_transcript_with_azure_openai(transcript_text, endpoint, deployment, api_key,
+                                           api_version='2024-02-15-preview'):
+    """Deprecated shim. Use summarize_transcript(transcript_text, ai_config) instead."""
+    ai_config = resolve_ai_config(
+        'azure',
+        azure_endpoint=endpoint,
+        azure_deployment=deployment,
+        azure_api_version=api_version,
+        azure_api_key=api_key,
+    )
+    return summarize_transcript(transcript_text, ai_config)
 
 
 def generate_transcript(input_file, output_file=None, language='en-US'):
@@ -626,10 +702,7 @@ def compress_video_with_transcript(input_file, output_file, transcript_file=None
 def run_processing_mode(mode, input_file, output_file, transcript_file=None,
                         crf=28, preset='fast', resolution=None,
                         audio_codec='aac', audio_bitrate='128k', language='en-US',
-                        summary_file=None, azure_endpoint=None,
-                        azure_deployment=None, azure_api_key=None,
-                        azure_api_version='2024-02-15-preview',
-                        azure_model_name=None):
+                        summary_file=None, ai_config=None):
     """Run one of the supported processing modes."""
 
     if mode == 'audio':
@@ -649,6 +722,9 @@ def run_processing_mode(mode, input_file, output_file, transcript_file=None,
         return transcript is not None
 
     if mode == 'transcript-summary':
+        if ai_config is None:
+            raise ValueError('ai_config is required for transcript-summary mode.')
+
         transcript = generate_transcript(
             input_file=input_file,
             output_file=output_file,
@@ -660,21 +736,28 @@ def run_processing_mode(mode, input_file, output_file, transcript_file=None,
         if not summary_file:
             summary_file = f"{os.path.splitext(output_file)[0]}_summary.txt"
 
-        summary_text = summarize_transcript_with_azure_openai(
-            transcript_text=transcript,
-            endpoint=azure_endpoint,
-            deployment=azure_deployment,
-            api_key=azure_api_key,
-            api_version=azure_api_version
-        )
+        summary_text = summarize_transcript(transcript, ai_config)
         save_text_output(summary_file, summary_text)
-        if azure_model_name:
-            print(f"🧠 Summary model reference: {azure_model_name}")
+
+        provider = ai_config.get('provider', 'unknown')
+        model_ref = ai_config.get('azure_deployment') if provider == 'azure' else ai_config.get('model')
+        if model_ref:
+            print(f"🧠 Summary model reference: {provider} / {model_ref}")
         print(f"🧠 Summary saved to: {summary_file}")
         return True
 
     print(f"❌ Unsupported mode: {mode}")
     return False
+
+
+def _default_ai_provider_from_env():
+    """Pick the default provider, preferring an explicit AI_PROVIDER but falling back to Azure for back-compat."""
+    explicit = (os.getenv('AI_PROVIDER') or '').strip().lower()
+    if explicit in AI_PROVIDERS:
+        return explicit
+    if os.getenv('AZURE_OPENAI_ENDPOINT'):
+        return 'azure'
+    return 'azure'
 
 
 def main():
@@ -688,7 +771,7 @@ def main():
         sys.exit(1)
     
     parser = argparse.ArgumentParser(
-        description="Video Processor Tool - Convert video to audio, transcribe video, or transcribe and summarize with Azure OpenAI",
+        description="Video Processor Tool - Convert video to audio, transcribe video, or transcribe and summarize with an AI provider (Azure, OpenAI, Ollama local/cloud, or any OpenAI-compatible endpoint).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -698,18 +781,27 @@ Examples:
     # 2) Get transcription from video
     python video_compressor.py input.mp4 transcript.txt --mode transcript --language en-US
 
-    # 3) Get transcription and summarize with Azure OpenAI
-    python video_compressor.py input.mp4 transcript.txt --mode transcript-summary --summary-output summary.txt --azure-endpoint https://your-resource.openai.azure.com --azure-deployment gpt-4o --azure-api-key YOUR_KEY
+    # 3) Transcribe + summarize with Azure OpenAI
+    python video_compressor.py input.mp4 transcript.txt --mode transcript-summary --summary-output summary.txt \\
+        --ai-provider azure --azure-endpoint https://your-resource.openai.azure.com --azure-deployment gpt-4o --azure-api-key YOUR_KEY
+
+    # 4) Transcribe + summarize with OpenAI
+    python video_compressor.py input.mp4 transcript.txt --mode transcript-summary --summary-output summary.txt \\
+        --ai-provider openai --ai-model gpt-4o-mini --ai-api-key sk-...
+
+    # 5) Transcribe + summarize with local Ollama (no API key needed)
+    python video_compressor.py input.mp4 transcript.txt --mode transcript-summary --summary-output summary.txt \\
+        --ai-provider ollama_local --ai-model llama3.1
         """
     )
-    
+
     parser.add_argument('input', help='Input video file path')
     parser.add_argument('output', help='Primary output path: audio file for audio mode, transcript file for transcript modes')
     parser.add_argument('--mode', default='audio', choices=['audio', 'transcript', 'transcript-summary'],
                        help='Processing mode: audio, transcript, or transcript-summary (default: audio)')
     parser.add_argument('--crf', type=int, default=28, choices=range(18, 31),
                        help='Constant Rate Factor (18-30, lower = better quality, default: 28)')
-    parser.add_argument('--preset', default='fast', 
+    parser.add_argument('--preset', default='fast',
                        choices=['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'],
                        help='Encoding preset (default: fast)')
     parser.add_argument('--resolution', nargs=2, type=int, metavar=('WIDTH', 'HEIGHT'),
@@ -719,32 +811,48 @@ Examples:
     parser.add_argument('--transcript', metavar='FILE', help='Generate transcript and save to specified file')
     parser.add_argument('--language', default='en-US', help='Language code for transcript generation (default: en-US)')
     parser.add_argument('--summary-output', metavar='FILE', help='Summary output file for transcript-summary mode')
+
+    parser.add_argument('--ai-provider', default=_default_ai_provider_from_env(), choices=list(AI_PROVIDERS),
+                       help='AI provider for summarization (default: from AI_PROVIDER env, or azure)')
+    parser.add_argument('--ai-base-url', default=os.getenv('AI_BASE_URL'),
+                       help='Base URL for OpenAI-compatible providers (e.g. https://api.openai.com/v1, http://localhost:11434/v1)')
+    parser.add_argument('--ai-model', default=os.getenv('AI_MODEL'),
+                       help='Model name for OpenAI-compatible providers')
+    parser.add_argument('--ai-api-key', default=os.getenv('AI_API_KEY'),
+                       help='API key for OpenAI-compatible providers')
+
     parser.add_argument('--azure-endpoint', default=os.getenv('AZURE_OPENAI_ENDPOINT'), help='Azure OpenAI endpoint URL')
     parser.add_argument('--azure-deployment', default=os.getenv('AZURE_OPENAI_DEPLOYMENT'), help='Azure OpenAI deployment name')
     parser.add_argument('--azure-api-key', default=os.getenv('AZURE_OPENAI_API_KEY'), help='Azure OpenAI API key')
     parser.add_argument('--azure-api-version', default=os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview'), help='Azure OpenAI API version')
-    parser.add_argument('--azure-model-name', default=os.getenv('AZURE_OPENAI_MODEL_NAME'), help='Azure OpenAI model name reference')
-    
+    parser.add_argument('--azure-model-name', default=os.getenv('AZURE_OPENAI_MODEL_NAME'), help='Azure OpenAI model name reference (informational)')
+
     args = parser.parse_args()
-    
+
     # Validate input file
     if not os.path.exists(args.input):
         print(f"❌ Input file not found: {args.input}")
         sys.exit(1)
-    
+
     print("🎬 Video Processor Tool")
     print("=" * 50)
 
+    ai_config = None
     if args.mode == 'transcript-summary':
-        missing_settings = []
-        if not args.azure_endpoint:
-            missing_settings.append('azure-endpoint')
-        if not args.azure_deployment:
-            missing_settings.append('azure-deployment')
-        if not args.azure_api_key:
-            missing_settings.append('azure-api-key')
-        if missing_settings:
-            print(f"❌ Missing Azure OpenAI settings: {', '.join(missing_settings)}")
+        ai_config = resolve_ai_config(
+            args.ai_provider,
+            base_url=args.ai_base_url,
+            model=args.ai_model,
+            api_key=args.ai_api_key,
+            azure_endpoint=args.azure_endpoint,
+            azure_deployment=args.azure_deployment,
+            azure_api_version=args.azure_api_version,
+            azure_api_key=args.azure_api_key,
+        )
+        try:
+            _validate_ai_config(ai_config)
+        except ValueError as exc:
+            print(f"❌ {exc}")
             sys.exit(1)
 
     success = run_processing_mode(
@@ -759,11 +867,7 @@ Examples:
         audio_bitrate=args.audio_bitrate,
         language=args.language,
         summary_file=args.summary_output,
-        azure_endpoint=args.azure_endpoint,
-        azure_deployment=args.azure_deployment,
-        azure_api_key=args.azure_api_key,
-        azure_api_version=args.azure_api_version,
-        azure_model_name=args.azure_model_name
+        ai_config=ai_config,
     )
     
     if success:

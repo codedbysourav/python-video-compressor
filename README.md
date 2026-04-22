@@ -12,7 +12,7 @@ A powerful Python-based video compression tool that uses FFmpeg to compress vide
 - **Cross-platform** - Works on Windows, macOS, and Linux
 - **Video to audio export** - Create audio-only output from video files
 - **Video transcription** - Generate transcript text directly from uploaded video
-- **Azure OpenAI summary support** - Summarize transcripts using your own Azure deployment
+- **Multi-provider AI summaries** - Summarize transcripts using Azure OpenAI, OpenAI, Ollama (local or cloud), or any OpenAI-compatible endpoint (Groq, Together, OpenRouter, LM Studio, vLLM, etc.)
 
 ## 🚀 Installation
 
@@ -54,18 +54,70 @@ A powerful Python-based video compression tool that uses FFmpeg to compress vide
 
 ### GUI Workflows
 
-The desktop app now supports these refined workflows:
+The desktop app supports these workflows:
 
 1. **Convert Video to Audio**
 2. **Transcribe Video**
 3. **Transcribe and Summarize with AI**
 
-For AI summaries, provide your Azure OpenAI settings in the GUI or through environment variables:
+For the summary workflow, pick a provider in the **AI Summarization Provider** card:
 
-- `AZURE_OPENAI_ENDPOINT`
-- `AZURE_OPENAI_DEPLOYMENT`
-- `AZURE_OPENAI_API_VERSION`
-- `AZURE_OPENAI_API_KEY`
+- **Azure OpenAI** — Endpoint, Deployment, API version, API key
+- **OpenAI** — Base URL (default `https://api.openai.com/v1`), Model (default `gpt-4o-mini`), API key
+- **OpenAI-compatible (custom)** — any host that speaks `/v1/chat/completions` (Groq, Together, OpenRouter, LM Studio, vLLM, …)
+- **Ollama (local)** — requires `ollama serve` running and the model pulled (`ollama pull llama3.1`); API key optional
+- **Ollama (cloud)** — Base URL `https://ollama.com/v1`, model from your Ollama account, API key from ollama.com
+
+Defaults auto-fill when you switch presets. You can also set defaults through environment variables (see [example.env](example.env)):
+
+```dotenv
+# Pick a provider: azure | openai | openai_compatible | ollama_local | ollama_cloud
+AI_PROVIDER=openai
+
+# Generic (used by openai / openai_compatible / ollama_local / ollama_cloud)
+AI_BASE_URL=https://api.openai.com/v1
+AI_MODEL=gpt-4o-mini
+AI_API_KEY=sk-...
+
+# Or for Azure
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini
+AZURE_OPENAI_API_VERSION=2024-12-01-preview
+AZURE_OPENAI_API_KEY=...
+```
+
+### CLI: AI Summary Examples
+
+```bash
+# Azure OpenAI
+python video_compressor.py input.mp4 transcript.txt --mode transcript-summary \
+    --summary-output summary.txt \
+    --ai-provider azure \
+    --azure-endpoint https://your-resource.openai.azure.com \
+    --azure-deployment gpt-4o --azure-api-key YOUR_KEY
+
+# OpenAI
+python video_compressor.py input.mp4 transcript.txt --mode transcript-summary \
+    --summary-output summary.txt \
+    --ai-provider openai --ai-model gpt-4o-mini --ai-api-key sk-...
+
+# Ollama local (no key needed, requires `ollama serve`)
+python video_compressor.py input.mp4 transcript.txt --mode transcript-summary \
+    --summary-output summary.txt \
+    --ai-provider ollama_local --ai-model llama3.1
+
+# Ollama cloud
+python video_compressor.py input.mp4 transcript.txt --mode transcript-summary \
+    --summary-output summary.txt \
+    --ai-provider ollama_cloud --ai-model llama3.1:70b --ai-api-key OLLAMA_KEY
+
+# Any OpenAI-compatible host (Groq in this example)
+python video_compressor.py input.mp4 transcript.txt --mode transcript-summary \
+    --summary-output summary.txt \
+    --ai-provider openai_compatible \
+    --ai-base-url https://api.groq.com/openai/v1 \
+    --ai-model mixtral-8x7b-instruct --ai-api-key gsk_...
+```
 
 ### Basic Usage
 

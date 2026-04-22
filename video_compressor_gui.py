@@ -10,13 +10,33 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from video_compressor import (
+    AI_PROVIDERS,
+    _validate_ai_config,
     convert_video_to_audio,
     generate_transcript,
     load_dotenv_file,
     merge_videos,
+    resolve_ai_config,
     save_text_output,
-    summarize_transcript_with_azure_openai,
+    summarize_transcript,
 )
+
+AI_PROVIDER_LABELS = [
+    ('azure', 'Azure OpenAI'),
+    ('openai', 'OpenAI'),
+    ('openai_compatible', 'OpenAI-compatible (custom)'),
+    ('ollama_local', 'Ollama (local)'),
+    ('ollama_cloud', 'Ollama (cloud)'),
+]
+AI_LABEL_TO_KEY = {label: key for key, label in AI_PROVIDER_LABELS}
+AI_KEY_TO_LABEL = {key: label for key, label in AI_PROVIDER_LABELS}
+
+AI_PRESET_DEFAULTS = {
+    'openai': {'base_url': 'https://api.openai.com/v1', 'model': 'gpt-4o-mini'},
+    'openai_compatible': {'base_url': '', 'model': ''},
+    'ollama_local': {'base_url': 'http://localhost:11434/v1', 'model': 'llama3.1'},
+    'ollama_cloud': {'base_url': 'https://ollama.com/v1', 'model': ''},
+}
 
 
 class VideoCompressorGUI:
@@ -63,6 +83,14 @@ class VideoCompressorGUI:
         self.azure_api_version = tk.StringVar(value=os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview'))
         self.azure_api_key = tk.StringVar(value=os.getenv('AZURE_OPENAI_API_KEY', ''))
 
+        default_provider = (os.getenv('AI_PROVIDER') or '').strip().lower()
+        if default_provider not in AI_PROVIDERS:
+            default_provider = 'azure' if os.getenv('AZURE_OPENAI_ENDPOINT') else 'azure'
+        self.ai_provider_label = tk.StringVar(value=AI_KEY_TO_LABEL[default_provider])
+        self.ai_base_url = tk.StringVar(value=os.getenv('AI_BASE_URL', ''))
+        self.ai_model = tk.StringVar(value=os.getenv('AI_MODEL', ''))
+        self.ai_api_key = tk.StringVar(value=os.getenv('AI_API_KEY', ''))
+
         self.summary_title_var = tk.StringVar(value="Convert video into an audio-only file")
         self.summary_detail_var = tk.StringVar(value="Creates an audio-only file using your selected codec and bitrate.")
         self.status_var = tk.StringVar(value="Ready")
@@ -71,6 +99,8 @@ class VideoCompressorGUI:
         self.audio_widgets = []
         self.transcript_widgets = []
         self.summary_widgets = []
+        self.ai_azure_widgets = []
+        self.ai_generic_widgets = []
 
         self.setup_styling()
         self.create_widgets()
@@ -144,10 +174,11 @@ class VideoCompressorGUI:
 
         self.create_summary_card(right_column, 0)
         self.create_transcript_section(right_column, 1)
-        self.create_ai_result_section(right_column, 2)
-        self.create_progress_section(right_column, 3)
-        self.create_control_buttons(right_column, 4)
-        self.create_status_bar(right_column, 5)
+        self.create_ai_provider_section(right_column, 2)
+        self.create_ai_result_section(right_column, 3)
+        self.create_progress_section(right_column, 4)
+        self.create_control_buttons(right_column, 5)
+        self.create_status_bar(right_column, 6)
 
         main_canvas.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y', padx=(0, 10), pady=10)
@@ -166,7 +197,7 @@ class VideoCompressorGUI:
         ttk.Label(hero, text='Studio Video Processor', style='HeroTitle.TLabel').grid(row=0, column=0, sticky='w')
         ttk.Label(
             hero,
-            text='Extract audio, generate transcripts directly from video, or create transcript summaries with Azure OpenAI.',
+            text='Extract audio, generate transcripts directly from video, or create transcript summaries with Azure OpenAI, OpenAI, or Ollama (local / cloud).',
             style='HeroText.TLabel'
         ).grid(row=1, column=0, sticky='w', pady=(8, 0))
 
@@ -253,7 +284,7 @@ class VideoCompressorGUI:
         options = [
             ('audio', 'Convert Video to Audio', 'Create an audio-only file from the uploaded video.'),
             ('transcript', 'Transcribe Video', 'Generate transcript text directly from the uploaded video.'),
-            ('transcript_summary', 'Transcribe and Summarize with AI', 'Create a transcript first, then generate an AI summary using Azure OpenAI.'),
+            ('transcript_summary', 'Transcribe and Summarize with AI', 'Create a transcript first, then generate an AI summary using Azure OpenAI, OpenAI, or Ollama.'),
         ]
 
         for index, (value, title, description) in enumerate(options):
@@ -348,6 +379,101 @@ class VideoCompressorGUI:
         note = ttk.Label(body, text='The app extracts audio from video and transcribes it in fixed chunks for better reliability on long files.', style='Muted.TLabel', wraplength=420, justify='left')
         note.grid(row=1, column=0, columnspan=2, sticky='w', pady=(10, 0))
         self.transcript_widgets.extend([language_label, language_combo, note])
+
+    def create_ai_provider_section(self, parent, row):
+        body, _ = self.create_card(parent, row, 'AI Summarization Provider',
+                                   'Pick the provider used to summarize transcripts. Azure OpenAI, OpenAI, or Ollama (local/cloud).')
+        body.columnconfigure(1, weight=1)
+
+        provider_label = ttk.Label(body, text='Provider', style='Body.TLabel')
+        provider_label.grid(row=0, column=0, sticky='w', pady=(0, 10), padx=(0, 12))
+        provider_values = [label for _, label in AI_PROVIDER_LABELS]
+        provider_combo = ttk.Combobox(
+            body,
+            textvariable=self.ai_provider_label,
+            values=provider_values,
+            state='readonly',
+            style='Modern.TCombobox',
+        )
+        provider_combo.grid(row=0, column=1, columnspan=2, sticky='ew', pady=(0, 10))
+        provider_combo.bind('<<ComboboxSelected>>', lambda _e: self.on_ai_provider_change())
+        self.summary_widgets.extend([provider_label, provider_combo])
+
+        # Azure fields
+        self.ai_azure_endpoint_label = ttk.Label(body, text='Azure endpoint', style='Body.TLabel')
+        self.ai_azure_endpoint_entry = ttk.Entry(body, textvariable=self.azure_endpoint, style='Modern.TEntry')
+        self.ai_azure_deployment_label = ttk.Label(body, text='Deployment', style='Body.TLabel')
+        self.ai_azure_deployment_entry = ttk.Entry(body, textvariable=self.azure_deployment, style='Modern.TEntry')
+        self.ai_azure_version_label = ttk.Label(body, text='API version', style='Body.TLabel')
+        self.ai_azure_version_entry = ttk.Entry(body, textvariable=self.azure_api_version, style='Modern.TEntry')
+        self.ai_azure_key_label = ttk.Label(body, text='API key', style='Body.TLabel')
+        self.ai_azure_key_entry = ttk.Entry(body, textvariable=self.azure_api_key, style='Modern.TEntry', show='*')
+
+        self.ai_azure_widgets = [
+            (self.ai_azure_endpoint_label, self.ai_azure_endpoint_entry),
+            (self.ai_azure_deployment_label, self.ai_azure_deployment_entry),
+            (self.ai_azure_version_label, self.ai_azure_version_entry),
+            (self.ai_azure_key_label, self.ai_azure_key_entry),
+        ]
+
+        # Generic (OpenAI-compatible + Ollama) fields
+        self.ai_base_url_label = ttk.Label(body, text='Base URL', style='Body.TLabel')
+        self.ai_base_url_entry = ttk.Entry(body, textvariable=self.ai_base_url, style='Modern.TEntry')
+        self.ai_model_label = ttk.Label(body, text='Model', style='Body.TLabel')
+        self.ai_model_entry = ttk.Entry(body, textvariable=self.ai_model, style='Modern.TEntry')
+        self.ai_key_label = ttk.Label(body, text='API key', style='Body.TLabel')
+        self.ai_key_entry = ttk.Entry(body, textvariable=self.ai_api_key, style='Modern.TEntry', show='*')
+
+        self.ai_generic_widgets = [
+            (self.ai_base_url_label, self.ai_base_url_entry),
+            (self.ai_model_label, self.ai_model_entry),
+            (self.ai_key_label, self.ai_key_entry),
+        ]
+
+        self.ai_provider_note = ttk.Label(body, text='', style='Muted.TLabel', wraplength=420, justify='left')
+
+        for label, entry in self.ai_azure_widgets + self.ai_generic_widgets:
+            self.summary_widgets.extend([label, entry])
+        self.summary_widgets.append(self.ai_provider_note)
+
+        self.on_ai_provider_change()
+
+    def on_ai_provider_change(self):
+        provider = AI_LABEL_TO_KEY.get(self.ai_provider_label.get(), 'azure')
+
+        # Hide everything first
+        for label, entry in self.ai_azure_widgets + self.ai_generic_widgets:
+            label.grid_remove()
+            entry.grid_remove()
+        self.ai_provider_note.grid_remove()
+
+        if provider == 'azure':
+            visible = self.ai_azure_widgets
+            note = 'Azure OpenAI uses your resource endpoint, deployment name, API version, and API key.'
+        else:
+            visible = self.ai_generic_widgets
+            defaults = AI_PRESET_DEFAULTS.get(provider, {})
+            if not self.ai_base_url.get().strip() and defaults.get('base_url'):
+                self.ai_base_url.set(defaults['base_url'])
+            if not self.ai_model.get().strip() and defaults.get('model'):
+                self.ai_model.set(defaults['model'])
+            if provider == 'openai':
+                note = 'OpenAI: base URL https://api.openai.com/v1 and a secret key (sk-...).'
+            elif provider == 'ollama_local':
+                note = 'Ollama local: run `ollama serve` and pull the model (e.g. `ollama pull llama3.1`). API key is optional.'
+            elif provider == 'ollama_cloud':
+                note = 'Ollama cloud: base URL https://ollama.com/v1 and an ollama.com API key.'
+            else:
+                note = 'OpenAI-compatible: any host speaking /v1/chat/completions (Groq, Together, OpenRouter, LM Studio, vLLM, etc.).'
+
+        for index, (label, entry) in enumerate(visible, start=1):
+            label.grid(row=index, column=0, sticky='w', pady=(0, 10), padx=(0, 12))
+            entry.grid(row=index, column=1, columnspan=2, sticky='ew', pady=(0, 10))
+
+        self.ai_provider_note.config(text=note)
+        self.ai_provider_note.grid(row=len(visible) + 1, column=0, columnspan=3, sticky='w', pady=(4, 0))
+
+        self.update_summary()
 
     def create_ai_result_section(self, parent, row):
         body, _ = self.create_card(parent, row, 'AI Refined Transcription', 'When you run the AI workflow, the generated refined text appears here and can be copied.')
@@ -519,8 +645,9 @@ class VideoCompressorGUI:
             self.summary_title_var.set('Generate a transcript directly from video')
             self.summary_detail_var.set('The app extracts audio from the video and writes the recognized speech to a transcript text file.')
         else:
-            self.summary_title_var.set('Generate transcript, then summarize with Azure OpenAI')
-            self.summary_detail_var.set('The app first creates a transcript from video, then sends that transcript to your Azure OpenAI deployment for a structured AI summary.')
+            provider_label = self.ai_provider_label.get() or 'Azure OpenAI'
+            self.summary_title_var.set(f'Generate transcript, then summarize with {provider_label}')
+            self.summary_detail_var.set('The app first creates a transcript from video, then sends that transcript to the selected AI provider for a structured summary.')
 
     def get_default_audio_file(self, input_path):
         base_name = os.path.splitext(input_path)[0]
@@ -659,14 +786,26 @@ class VideoCompressorGUI:
         if mode == 'transcript_summary':
             if not self.summary_file.get():
                 return 'Please select a summary output file.'
-            if not self.azure_endpoint.get().strip():
-                return 'Missing AZURE_OPENAI_ENDPOINT in environment or .env.'
-            if not self.azure_deployment.get().strip():
-                return 'Missing AZURE_OPENAI_DEPLOYMENT in environment or .env.'
-            if not self.azure_api_key.get().strip():
-                return 'Missing AZURE_OPENAI_API_KEY in environment or .env.'
+            try:
+                ai_config = self._build_ai_config()
+                _validate_ai_config(ai_config)
+            except ValueError as exc:
+                return str(exc)
 
         return None
+
+    def _build_ai_config(self):
+        provider = AI_LABEL_TO_KEY.get(self.ai_provider_label.get(), 'azure')
+        return resolve_ai_config(
+            provider,
+            base_url=self.ai_base_url.get(),
+            model=self.ai_model.get(),
+            api_key=self.ai_api_key.get(),
+            azure_endpoint=self.azure_endpoint.get(),
+            azure_deployment=self.azure_deployment.get(),
+            azure_api_version=self.azure_api_version.get() or '2024-02-15-preview',
+            azure_api_key=self.azure_api_key.get(),
+        )
 
     def start_processing(self):
         validation_error = self.validate_inputs()
@@ -753,25 +892,24 @@ class VideoCompressorGUI:
                 self.status_var.set('Transcription completed')
                 return
 
-            self.status_var.set('Summarizing transcript with Azure OpenAI...')
+            ai_config = self._build_ai_config()
+            provider_label = self.ai_provider_label.get() or AI_KEY_TO_LABEL.get(ai_config['provider'], ai_config['provider'])
+            self.status_var.set(f'Summarizing transcript with {provider_label}...')
             self.progress_var.set(72)
-            self.log_message('Submitting transcript to Azure OpenAI for summary...')
+            self.log_message(f'Submitting transcript to {provider_label} for summary...')
 
-            summary_text = summarize_transcript_with_azure_openai(
-                transcript_text=transcript_text,
-                endpoint=self.azure_endpoint.get().strip(),
-                deployment=self.azure_deployment.get().strip(),
-                api_key=self.azure_api_key.get().strip(),
-                api_version=self.azure_api_version.get().strip() or '2024-02-15-preview',
-            )
+            summary_text = summarize_transcript(transcript_text, ai_config)
             save_text_output(self.summary_file.get(), summary_text)
             self.set_ai_result(summary_text)
 
             self.progress_var.set(100)
             self.status_var.set('Transcription and AI summary completed')
             self.log_message('AI summary created successfully')
-            if self.azure_model_name.get().strip():
-                self.log_message(f"Model reference: {self.azure_model_name.get().strip()}")
+            if ai_config['provider'] == 'azure':
+                if self.azure_model_name.get().strip():
+                    self.log_message(f"Model reference: {self.azure_model_name.get().strip()}")
+            elif ai_config.get('model'):
+                self.log_message(f"Model reference: {provider_label} / {ai_config['model']}")
             self.log_output_file('Summary file', self.summary_file.get())
             self.log_message(f'Summary preview: {summary_text[:140]}...')
 
@@ -830,6 +968,14 @@ class VideoCompressorGUI:
         self.azure_model_name.set(os.getenv('AZURE_OPENAI_MODEL_NAME', ''))
         self.azure_api_version.set(os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview'))
         self.azure_api_key.set(os.getenv('AZURE_OPENAI_API_KEY', ''))
+        default_provider = (os.getenv('AI_PROVIDER') or '').strip().lower()
+        if default_provider not in AI_PROVIDERS:
+            default_provider = 'azure'
+        self.ai_provider_label.set(AI_KEY_TO_LABEL[default_provider])
+        self.ai_base_url.set(os.getenv('AI_BASE_URL', ''))
+        self.ai_model.set(os.getenv('AI_MODEL', ''))
+        self.ai_api_key.set(os.getenv('AI_API_KEY', ''))
+        self.on_ai_provider_change()
         self.progress_var.set(0)
         self.clear_log()
         self.clear_ai_result()
