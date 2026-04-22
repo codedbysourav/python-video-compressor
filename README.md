@@ -12,6 +12,7 @@ A powerful Python-based video compression tool that uses FFmpeg to compress vide
 - **Cross-platform** - Works on Windows, macOS, and Linux
 - **Video to audio export** - Create audio-only output from video files
 - **Video transcription** - Generate transcript text directly from uploaded video
+- **Pluggable transcription** - Use Google Speech Recognition (default, online), faster-whisper (local Whisper, offline after first download), or Gemma 4 E2B-it (local multimodal LLM)
 - **Multi-provider AI summaries** - Summarize transcripts using Azure OpenAI, OpenAI, Ollama (local or cloud), or any OpenAI-compatible endpoint (Groq, Together, OpenRouter, LM Studio, vLLM, etc.)
 
 ## 🚀 Installation
@@ -50,6 +51,16 @@ A powerful Python-based video compression tool that uses FFmpeg to compress vide
    pip install -r requirements.txt
    ```
 
+Optional local transcription engines are lazy-loaded, so the default Google path needs no extra packages:
+
+```bash
+# Local Whisper transcription
+pip install faster-whisper
+
+# Local Gemma 4 E2B-it transcription
+pip install "transformers>=4.58" torch accelerate soundfile librosa
+```
+
 ## 📖 Usage
 
 ### GUI Workflows
@@ -59,6 +70,12 @@ The desktop app supports these workflows:
 1. **Convert Video to Audio**
 2. **Transcribe Video**
 3. **Transcribe and Summarize with AI**
+
+For transcription workflows, pick an engine in **Transcription Settings**:
+
+- **Google Speech Recognition** — default online path, no new dependencies
+- **faster-whisper (local)** — downloads the selected Whisper model from HuggingFace on first run
+- **Gemma 4 E2B-it (local)** — downloads the Gemma multimodal model on first run and processes audio in 30-second chunks
 
 For the summary workflow, pick a provider in the **AI Summarization Provider** card:
 
@@ -79,11 +96,34 @@ AI_BASE_URL=https://api.openai.com/v1
 AI_MODEL=gpt-4o-mini
 AI_API_KEY=sk-...
 
+# Transcription
+TRANSCRIPT_PROVIDER=faster_whisper
+WHISPER_MODEL=large-v3-turbo
+WHISPER_DEVICE=auto
+WHISPER_COMPUTE_TYPE=auto
+
 # Or for Azure
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_OPENAI_DEPLOYMENT=gpt-4o-mini
 AZURE_OPENAI_API_VERSION=2024-12-01-preview
 AZURE_OPENAI_API_KEY=...
+```
+
+### CLI: Transcription Provider Examples
+
+```bash
+# Default Google Speech Recognition
+python video_compressor.py input.mp4 transcript.txt --mode transcript --language en-US
+
+# Local faster-whisper
+python video_compressor.py input.mp4 transcript.txt --mode transcript \
+    --transcript-provider faster_whisper \
+    --whisper-model large-v3-turbo --whisper-device auto
+
+# Local Gemma 4 E2B-it
+python video_compressor.py input.mp4 transcript.txt --mode transcript \
+    --transcript-provider gemma4_local \
+    --gemma-model google/gemma-4-E2B-it --gemma-device auto
 ```
 
 ### CLI: AI Summary Examples
@@ -122,21 +162,21 @@ python video_compressor.py input.mp4 transcript.txt --mode transcript-summary \
 ### Basic Usage
 
 ```bash
-# Simple compression with default settings (CRF=28, preset=fast)
-python video_compressor.py input.mp4 output.mp4
+# Convert video to audio with the default CLI mode
+python video_compressor.py input.mp4 output.mp3 --audio-codec mp3
 ```
 
 ### Processing Modes
 
 ```bash
-# 1) Compress the size
-python video_compressor.py input.mp4 output.mp4 --mode compress
-
-# 2) Convert video to audio
+# 1) Convert video to audio
 python video_compressor.py input.mp4 output.mp3 --mode audio --audio-codec mp3
 
-# 3) Convert video to audio and then get transcription
-python video_compressor.py input.mp4 output.mp3 --mode audio-transcript --transcript transcript.txt --language en-US
+# 2) Transcribe video
+python video_compressor.py input.mp4 transcript.txt --mode transcript --language en-US
+
+# 3) Transcribe video and summarize it with an AI provider
+python video_compressor.py input.mp4 transcript.txt --mode transcript-summary --summary-output summary.txt
 ```
 
 ### Advanced Usage
@@ -164,7 +204,14 @@ python video_compressor.py input.mp4 output.mp4 --audio-codec mp3 --audio-bitrat
 | `--resolution` | Target resolution (WIDTH HEIGHT) | Original | Any positive integers |
 | `--audio-codec` | Audio codec | aac | Any FFmpeg audio codec |
 | `--audio-bitrate` | Audio bitrate | 128k | Any valid bitrate |
-| `--mode` | Processing mode | compress | compress, audio, audio-transcript |
+| `--mode` | Processing mode | audio | audio, transcript, transcript-summary |
+| `--language` | Transcript language code | en-US | e.g. en-US, es-ES, fr-FR |
+| `--transcript-provider` | Speech-to-text engine | google | google, faster_whisper, gemma4_local |
+| `--whisper-model` | faster-whisper model | large-v3-turbo | tiny, base, small, medium, large-v3, large-v3-turbo |
+| `--whisper-device` | faster-whisper device | auto | auto, cpu, cuda, mps |
+| `--whisper-compute-type` | faster-whisper compute type | auto | auto, int8, float16 |
+| `--gemma-model` | Gemma model ID | google/gemma-4-E2B-it | Any compatible HuggingFace model ID |
+| `--gemma-device` | Gemma device | auto | auto, cpu, cuda, mps |
 
 ## Docker Usage
 
@@ -279,6 +326,19 @@ Based on your 1.7GB screen recording example:
    - Decrease CRF value (28 → 20)
    - Use slower preset (fast → slow)
    - Keep original resolution
+
+5. **Local transcription dependency errors**
+   - For faster-whisper, install `faster-whisper`
+   - For Gemma 4, install `transformers>=4.58`, `torch`, `accelerate`, `soundfile`, and `librosa`
+
+6. **First local transcription run is slow**
+   - faster-whisper downloads the selected model before transcribing
+   - Gemma 4 local downloads a much larger model before first use
+   - Subsequent runs reuse the HuggingFace cache
+
+7. **Device-specific local model issues**
+   - Try `--whisper-device cpu` or `--gemma-device cpu` if `auto`, MPS, or CUDA fails
+   - Gemma 4 support depends on a recent enough `transformers` release
 
 ### Performance Tips
 

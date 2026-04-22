@@ -15,6 +15,7 @@ import urllib.request
 import ffmpeg
 import speech_recognition as sr
 import tempfile
+import wave
 
 
 def load_dotenv_file(dotenv_path='.env'):
@@ -343,6 +344,124 @@ def _validate_ai_config(ai_config):
         raise ValueError(f'{provider}: API key is required.')
 
 
+TRANSCRIPT_PROVIDERS = ('google', 'faster_whisper', 'gemma4_local')
+
+_TRANSCRIPT_PROVIDER_DEFAULTS = {
+    'google': {},
+    'faster_whisper': {
+        'whisper_model': 'large-v3-turbo',
+        'whisper_device': 'auto',
+        'whisper_compute_type': 'auto',
+    },
+    'gemma4_local': {
+        'gemma_model_id': 'google/gemma-4-E2B-it',
+        'gemma_device': 'auto',
+        'gemma_max_new_tokens': 512,
+    },
+}
+
+_WHISPER_MODELS = {}
+_GEMMA_MODELS = {}
+
+
+def resolve_transcript_config(provider='google', language='en-US',
+                              whisper_model=None, whisper_device=None,
+                              whisper_compute_type=None,
+                              gemma_model_id=None, gemma_device=None,
+                              gemma_max_new_tokens=None):
+    """Build a normalized transcript_config dict, filling preset defaults."""
+    provider = (provider or 'google').strip().lower()
+    if provider not in TRANSCRIPT_PROVIDERS:
+        raise ValueError(f'Unknown transcript provider: {provider}. Choose from {TRANSCRIPT_PROVIDERS}.')
+
+    cfg = {
+        'provider': provider,
+        'language': (language or 'en-US').strip() or 'en-US',
+    }
+
+    if provider == 'faster_whisper':
+        defaults = _TRANSCRIPT_PROVIDER_DEFAULTS['faster_whisper']
+        cfg.update({
+            'whisper_model': (whisper_model or defaults['whisper_model']).strip(),
+            'whisper_device': (whisper_device or defaults['whisper_device']).strip().lower(),
+            'whisper_compute_type': (whisper_compute_type or defaults['whisper_compute_type']).strip().lower(),
+        })
+    elif provider == 'gemma4_local':
+        defaults = _TRANSCRIPT_PROVIDER_DEFAULTS['gemma4_local']
+        max_tokens = gemma_max_new_tokens
+        if max_tokens in (None, ''):
+            max_tokens = defaults['gemma_max_new_tokens']
+        try:
+            max_tokens = int(max_tokens)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('gemma4_local: max new tokens must be an integer.') from exc
+        cfg.update({
+            'gemma_model_id': (gemma_model_id or defaults['gemma_model_id']).strip(),
+            'gemma_device': (gemma_device or defaults['gemma_device']).strip().lower(),
+            'gemma_max_new_tokens': max_tokens,
+        })
+
+    return cfg
+
+
+def _validate_transcript_config(transcript_config):
+    """Raise ValueError if transcript provider settings are incomplete."""
+    provider = transcript_config.get('provider')
+    if provider not in TRANSCRIPT_PROVIDERS:
+        raise ValueError(f'Unknown transcript provider: {provider}. Choose from {TRANSCRIPT_PROVIDERS}.')
+
+    if not transcript_config.get('language'):
+        raise ValueError('Transcript language is required.')
+
+    if provider == 'faster_whisper':
+        if not transcript_config.get('whisper_model'):
+            raise ValueError('faster_whisper: model name is required.')
+        if not transcript_config.get('whisper_device'):
+            raise ValueError('faster_whisper: device is required.')
+        if not transcript_config.get('whisper_compute_type'):
+            raise ValueError('faster_whisper: compute type is required.')
+    elif provider == 'gemma4_local':
+        if not transcript_config.get('gemma_model_id'):
+            raise ValueError('gemma4_local: model ID is required.')
+        if not transcript_config.get('gemma_device'):
+            raise ValueError('gemma4_local: device is required.')
+        try:
+            max_tokens = int(transcript_config.get('gemma_max_new_tokens', 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError('gemma4_local: max new tokens must be an integer.') from exc
+        if max_tokens <= 0:
+            raise ValueError('gemma4_local: max new tokens must be a positive integer.')
+
+
+_LANGUAGE_NAMES = {
+    'en': 'English',
+    'es': 'Spanish',
+    'fr': 'French',
+    'de': 'German',
+    'it': 'Italian',
+    'pt': 'Portuguese',
+    'ja': 'Japanese',
+    'zh': 'Chinese',
+    'ko': 'Korean',
+    'hi': 'Hindi',
+}
+
+
+def _normalize_language(user_code, provider):
+    """Convert a user-facing language code to the shape required by a provider."""
+    language = (user_code or 'en-US').strip() or 'en-US'
+    base_language = language.replace('_', '-').split('-')[0].lower()
+
+    if provider == 'google':
+        return language
+    if provider == 'faster_whisper':
+        return base_language
+    if provider == 'gemma4_local':
+        return _LANGUAGE_NAMES.get(base_language, language)
+
+    raise ValueError(f'Unknown transcript provider for language normalization: {provider}')
+
+
 def _azure_chat_completion_request(ai_config, payload):
     endpoint = ai_config['azure_endpoint'].rstrip('/')
     deployment_name = urllib.parse.quote(ai_config['azure_deployment'], safe='')
@@ -490,25 +609,10 @@ def summarize_transcript_with_azure_openai(transcript_text, endpoint, deployment
     return summarize_transcript(transcript_text, ai_config)
 
 
-def generate_transcript(input_file, output_file=None, language='en-US'):
-    """
-    Generate transcript from video file using speech recognition with robust error handling.
-    
-    Args:
-        input_file (str): Path to input video file
-        output_file (str): Path to output transcript file (optional)
-        language (str): Language code for speech recognition (default: en-US)
-    
-    Returns:
-        str: Generated transcript text
-    """
-    
+def _extract_audio_to_wav(input_file):
+    """Extract media audio to a mono 16 kHz PCM WAV temp file shared by all providers."""
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"Input file not found: {input_file}")
-    
-    # Initialize recognizer
-    recognizer = sr.Recognizer()
-    recognizer.dynamic_energy_threshold = True
 
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_audio:
         temp_audio_path = temp_audio.name
@@ -529,20 +633,92 @@ def generate_transcript(input_file, output_file=None, language='en-US'):
             .overwrite_output()
             .run(capture_stdout=True, capture_stderr=True, quiet=True)
         )
+        return temp_audio_path
+    except Exception:
+        if os.path.exists(temp_audio_path):
+            os.unlink(temp_audio_path)
+        raise
 
-        transcript = _transcribe_wav_in_chunks(temp_audio_path, language, recognizer)
+
+def _split_wav_30s(audio_path, chunk_seconds=30):
+    """Split a PCM WAV file into temporary fixed-duration WAV chunks."""
+    chunk_paths = []
+    with wave.open(audio_path, 'rb') as source:
+        params = source.getparams()
+        frames_per_chunk = int(source.getframerate() * chunk_seconds)
+
+        while True:
+            frames = source.readframes(frames_per_chunk)
+            if not frames:
+                break
+
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as chunk_file:
+                chunk_path = chunk_file.name
+
+            with wave.open(chunk_path, 'wb') as destination:
+                destination.setparams(params)
+                destination.writeframes(frames)
+
+            chunk_paths.append(chunk_path)
+
+    return chunk_paths
+
+
+def _coerce_transcript_config(transcript_config, language):
+    """Accept partial caller configs while preserving legacy language behavior."""
+    if transcript_config is None:
+        return resolve_transcript_config('google', language=language)
+
+    provider = transcript_config.get('provider', 'google')
+    return resolve_transcript_config(
+        provider,
+        language=transcript_config.get('language', language),
+        whisper_model=transcript_config.get('whisper_model'),
+        whisper_device=transcript_config.get('whisper_device'),
+        whisper_compute_type=transcript_config.get('whisper_compute_type'),
+        gemma_model_id=transcript_config.get('gemma_model_id'),
+        gemma_device=transcript_config.get('gemma_device'),
+        gemma_max_new_tokens=transcript_config.get('gemma_max_new_tokens'),
+    )
+
+
+def generate_transcript(input_file, output_file=None, language='en-US', transcript_config=None):
+    """
+    Generate transcript from media using the configured transcription provider.
+    
+    Args:
+        input_file (str): Path to input video file
+        output_file (str): Path to output transcript file (optional)
+        language (str): Back-compatible language code (default: en-US)
+        transcript_config (dict): Optional provider config from resolve_transcript_config()
+    
+    Returns:
+        str: Generated transcript text
+    """
+    temp_audio_path = None
+
+    try:
+        cfg = _coerce_transcript_config(transcript_config, language)
+        _validate_transcript_config(cfg)
+
+        temp_audio_path = _extract_audio_to_wav(input_file)
+
+        provider = cfg['provider']
+        if provider == 'google':
+            transcript = _transcribe_google(temp_audio_path, cfg['language'])
+        elif provider == 'faster_whisper':
+            transcript = _transcribe_faster_whisper(temp_audio_path, cfg)
+        elif provider == 'gemma4_local':
+            transcript = _transcribe_gemma4_local(temp_audio_path, cfg)
+        else:
+            raise ValueError(f"Unsupported transcript provider: {provider}")
+
         if not transcript:
             print("❌ No transcript generated")
             return None
 
         if output_file:
-            output_dir = os.path.dirname(output_file)
-            if output_dir and not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(transcript)
-
+            save_text_output(output_file, transcript)
             print(f"📝 Transcript saved to: {output_file}")
 
         return transcript
@@ -551,7 +727,7 @@ def generate_transcript(input_file, output_file=None, language='en-US'):
         print(f"❌ Error during transcript generation: {str(e)}")
         return None
     finally:
-        if os.path.exists(temp_audio_path):
+        if temp_audio_path and os.path.exists(temp_audio_path):
             os.unlink(temp_audio_path)
 
 
@@ -572,6 +748,148 @@ def _language_candidates(language):
         if item not in unique_candidates:
             unique_candidates.append(item)
     return unique_candidates
+
+
+def _transcribe_google(audio_wav_path, language):
+    """Transcribe a WAV through the existing Google Speech Recognition chunk path."""
+    recognizer = sr.Recognizer()
+    recognizer.dynamic_energy_threshold = True
+    normalized_language = _normalize_language(language, 'google')
+    return _transcribe_wav_in_chunks(audio_wav_path, normalized_language, recognizer)
+
+
+def _transcribe_faster_whisper(audio_wav_path, cfg):
+    """Transcribe a whole WAV with faster-whisper, loaded only when requested."""
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            'faster_whisper transcription requires the optional dependency: '
+            'pip install faster-whisper'
+        ) from exc
+
+    key = (cfg['whisper_model'], cfg['whisper_device'], cfg['whisper_compute_type'])
+    model = _WHISPER_MODELS.get(key)
+    if model is None:
+        print(f"🎤 Loading faster-whisper model: {cfg['whisper_model']}")
+        model = WhisperModel(
+            cfg['whisper_model'],
+            device=cfg['whisper_device'],
+            compute_type=cfg['whisper_compute_type'],
+        )
+        _WHISPER_MODELS[key] = model
+
+    language = _normalize_language(cfg['language'], 'faster_whisper')
+    print("🎤 Transcribing with faster-whisper...")
+    segments, _info = model.transcribe(audio_wav_path, language=language, vad_filter=True)
+    parts = [segment.text.strip() for segment in segments if getattr(segment, 'text', '').strip()]
+    return ' '.join(parts) if parts else None
+
+
+def _load_gemma4_model(cfg):
+    """Load and cache the Gemma multimodal model/processor pair."""
+    try:
+        import torch  # noqa: F401 - imported here to surface a clearer optional-dependency error
+        from transformers import AutoProcessor
+        try:
+            from transformers import AutoModelForMultimodalLM
+        except ImportError as exc:
+            raise RuntimeError(
+                'Gemma 4 local transcription requires a transformers version with '
+                'AutoModelForMultimodalLM support. Try: pip install "transformers>=4.58" '
+                'torch accelerate soundfile librosa'
+            ) from exc
+    except ImportError as exc:
+        raise RuntimeError(
+            'gemma4_local transcription requires optional dependencies: '
+            'pip install "transformers>=4.58" torch accelerate soundfile librosa'
+        ) from exc
+
+    key = (cfg['gemma_model_id'], cfg['gemma_device'])
+    cached = _GEMMA_MODELS.get(key)
+    if cached is not None:
+        return cached
+
+    print(f"🎤 Loading Gemma local model: {cfg['gemma_model_id']}")
+    processor = AutoProcessor.from_pretrained(cfg['gemma_model_id'])
+    model_kwargs = {'dtype': 'auto'}
+    if cfg['gemma_device'] == 'auto':
+        model_kwargs['device_map'] = 'auto'
+
+    try:
+        model = AutoModelForMultimodalLM.from_pretrained(cfg['gemma_model_id'], **model_kwargs)
+    except TypeError:
+        # Older transformers builds used torch_dtype before dtype became common.
+        model_kwargs.pop('dtype', None)
+        model_kwargs['torch_dtype'] = 'auto'
+        model = AutoModelForMultimodalLM.from_pretrained(cfg['gemma_model_id'], **model_kwargs)
+
+    if cfg['gemma_device'] != 'auto':
+        model = model.to(cfg['gemma_device'])
+
+    _GEMMA_MODELS[key] = (processor, model)
+    return processor, model
+
+
+def _model_device(model):
+    """Best-effort device lookup for moving processor tensors."""
+    device = getattr(model, 'device', None)
+    if device is not None:
+        return device
+
+    try:
+        return next(model.parameters()).device
+    except (AttributeError, StopIteration):
+        return None
+
+
+def _transcribe_gemma4_local(audio_wav_path, cfg):
+    """Transcribe 30-second WAV chunks with a local Gemma multimodal model."""
+    processor, model = _load_gemma4_model(cfg)
+    chunk_paths = _split_wav_30s(audio_wav_path, chunk_seconds=30)
+    if not chunk_paths:
+        return None
+
+    language_name = _normalize_language(cfg['language'], 'gemma4_local')
+    prompt = (
+        f"Transcribe the following speech segment in {language_name}. "
+        "Only output the transcription, with no commentary or newlines. "
+        "When transcribing numbers, write digits (e.g. '3' not 'three')."
+    )
+    device = _model_device(model)
+    transcript_parts = []
+
+    try:
+        for index, chunk_path in enumerate(chunk_paths, start=1):
+            print(f"🎤 Gemma transcription chunk {index}/{len(chunk_paths)}")
+            messages = [{
+                'role': 'user',
+                'content': [
+                    {'type': 'audio', 'audio': chunk_path},
+                    {'type': 'text', 'text': prompt},
+                ],
+            }]
+            inputs = processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_dict=True,
+                return_tensors='pt',
+                add_generation_prompt=True,
+            )
+            if device is not None:
+                inputs = inputs.to(device)
+
+            input_len = inputs['input_ids'].shape[-1]
+            outputs = model.generate(**inputs, max_new_tokens=cfg['gemma_max_new_tokens'])
+            decoded = processor.decode(outputs[0][input_len:], skip_special_tokens=True).strip()
+            if decoded:
+                transcript_parts.append(decoded)
+
+        return ' '.join(transcript_parts) if transcript_parts else None
+    finally:
+        for chunk_path in chunk_paths:
+            if os.path.exists(chunk_path):
+                os.unlink(chunk_path)
 
 
 def _recognize_chunk(audio_chunk, language, recognizer):
@@ -648,7 +966,7 @@ def _transcribe_wav_in_chunks(audio_path, language, recognizer, chunk_seconds=30
 def compress_video_with_transcript(input_file, output_file, transcript_file=None, 
                                   crf=28, preset='fast', resolution=None, 
                                   audio_codec='aac', audio_bitrate='128k',
-                                  language='en-US'):
+                                  language='en-US', transcript_config=None):
     """
     Compress video and optionally generate transcript.
     
@@ -687,7 +1005,12 @@ def compress_video_with_transcript(input_file, output_file, transcript_file=None
         print("\n" + "=" * 60)
         print("📝 Starting transcript generation...")
         
-        transcript = generate_transcript(input_file, transcript_file, language)
+        transcript = generate_transcript(
+            input_file,
+            transcript_file,
+            language,
+            transcript_config=transcript_config,
+        )
         
         if transcript:
             print(f"✅ Transcript generation completed successfully!")
@@ -702,7 +1025,7 @@ def compress_video_with_transcript(input_file, output_file, transcript_file=None
 def run_processing_mode(mode, input_file, output_file, transcript_file=None,
                         crf=28, preset='fast', resolution=None,
                         audio_codec='aac', audio_bitrate='128k', language='en-US',
-                        summary_file=None, ai_config=None):
+                        summary_file=None, ai_config=None, transcript_config=None):
     """Run one of the supported processing modes."""
 
     if mode == 'audio':
@@ -717,7 +1040,8 @@ def run_processing_mode(mode, input_file, output_file, transcript_file=None,
         transcript = generate_transcript(
             input_file=input_file,
             output_file=output_file,
-            language=language
+            language=language,
+            transcript_config=transcript_config,
         )
         return transcript is not None
 
@@ -728,7 +1052,8 @@ def run_processing_mode(mode, input_file, output_file, transcript_file=None,
         transcript = generate_transcript(
             input_file=input_file,
             output_file=output_file,
-            language=language
+            language=language,
+            transcript_config=transcript_config,
         )
         if not transcript:
             return False
@@ -758,6 +1083,14 @@ def _default_ai_provider_from_env():
     if os.getenv('AZURE_OPENAI_ENDPOINT'):
         return 'azure'
     return 'azure'
+
+
+def _default_transcript_provider_from_env():
+    """Pick the default transcription provider from env, falling back to Google."""
+    explicit = (os.getenv('TRANSCRIPT_PROVIDER') or '').strip().lower()
+    if explicit in TRANSCRIPT_PROVIDERS:
+        return explicit
+    return 'google'
 
 
 def main():
@@ -812,6 +1145,25 @@ Examples:
     parser.add_argument('--language', default='en-US', help='Language code for transcript generation (default: en-US)')
     parser.add_argument('--summary-output', metavar='FILE', help='Summary output file for transcript-summary mode')
 
+    parser.add_argument('--transcript-provider', default=_default_transcript_provider_from_env(),
+                       choices=list(TRANSCRIPT_PROVIDERS),
+                       help='Transcription provider (default: from TRANSCRIPT_PROVIDER env, or google)')
+    parser.add_argument('--whisper-model', default=os.getenv('WHISPER_MODEL', 'large-v3-turbo'),
+                       help='faster-whisper model name (default: large-v3-turbo)')
+    parser.add_argument('--whisper-device', default=os.getenv('WHISPER_DEVICE', 'auto'),
+                       choices=['auto', 'cpu', 'cuda', 'mps'],
+                       help='faster-whisper device (default: auto)')
+    parser.add_argument('--whisper-compute-type', default=os.getenv('WHISPER_COMPUTE_TYPE', 'auto'),
+                       help='faster-whisper compute type (default: auto)')
+    parser.add_argument('--gemma-model', default=os.getenv('GEMMA_MODEL_ID', 'google/gemma-4-E2B-it'),
+                       help='Gemma local model ID (default: google/gemma-4-E2B-it)')
+    parser.add_argument('--gemma-device', default=os.getenv('GEMMA_DEVICE', 'auto'),
+                       choices=['auto', 'cpu', 'cuda', 'mps'],
+                       help='Gemma local device (default: auto)')
+    parser.add_argument('--gemma-max-new-tokens', type=int,
+                       default=os.getenv('GEMMA_MAX_NEW_TOKENS', '512'),
+                       help='Gemma max generated tokens per chunk (default: 512)')
+
     parser.add_argument('--ai-provider', default=_default_ai_provider_from_env(), choices=list(AI_PROVIDERS),
                        help='AI provider for summarization (default: from AI_PROVIDER env, or azure)')
     parser.add_argument('--ai-base-url', default=os.getenv('AI_BASE_URL'),
@@ -855,6 +1207,24 @@ Examples:
             print(f"❌ {exc}")
             sys.exit(1)
 
+    transcript_config = None
+    if args.mode in {'transcript', 'transcript-summary'}:
+        transcript_config = resolve_transcript_config(
+            args.transcript_provider,
+            language=args.language,
+            whisper_model=args.whisper_model,
+            whisper_device=args.whisper_device,
+            whisper_compute_type=args.whisper_compute_type,
+            gemma_model_id=args.gemma_model,
+            gemma_device=args.gemma_device,
+            gemma_max_new_tokens=args.gemma_max_new_tokens,
+        )
+        try:
+            _validate_transcript_config(transcript_config)
+        except ValueError as exc:
+            print(f"❌ {exc}")
+            sys.exit(1)
+
     success = run_processing_mode(
         mode=args.mode,
         input_file=args.input,
@@ -868,6 +1238,7 @@ Examples:
         language=args.language,
         summary_file=args.summary_output,
         ai_config=ai_config,
+        transcript_config=transcript_config,
     )
     
     if success:

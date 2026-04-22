@@ -1,3 +1,9 @@
 ffmpeg-python>=0.2.0
 pathlib2>=2.3.7; python_version < "3.4"
 SpeechRecognition>=3.10.0
+
+# Optional — enable faster-whisper transcription:
+#   pip install faster-whisper
+#
+# Optional — enable Gemma 4 E2B-it local transcription:
+#   pip install "transformers>=4.58" torch accelerate soundfile librosa

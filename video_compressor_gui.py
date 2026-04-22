@@ -11,12 +11,15 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from video_compressor import (
     AI_PROVIDERS,
+    TRANSCRIPT_PROVIDERS,
     _validate_ai_config,
+    _validate_transcript_config,
     convert_video_to_audio,
     generate_transcript,
     load_dotenv_file,
     merge_videos,
     resolve_ai_config,
+    resolve_transcript_config,
     save_text_output,
     summarize_transcript,
 )
@@ -37,6 +40,14 @@ AI_PRESET_DEFAULTS = {
     'ollama_local': {'base_url': 'http://localhost:11434/v1', 'model': 'llama3.1'},
     'ollama_cloud': {'base_url': 'https://ollama.com/v1', 'model': ''},
 }
+
+TRANSCRIPT_PROVIDER_LABELS = [
+    ('google', 'Google Speech Recognition'),
+    ('faster_whisper', 'faster-whisper (local)'),
+    ('gemma4_local', 'Gemma 4 E2B-it (local)'),
+]
+TRANSCRIPT_LABEL_TO_KEY = {label: key for key, label in TRANSCRIPT_PROVIDER_LABELS}
+TRANSCRIPT_KEY_TO_LABEL = {key: label for key, label in TRANSCRIPT_PROVIDER_LABELS}
 
 
 class VideoCompressorGUI:
@@ -77,6 +88,17 @@ class VideoCompressorGUI:
         self.audio_bitrate = tk.StringVar(value="128k")
         self.transcript_language = tk.StringVar(value="en-US")
 
+        default_transcript_provider = (os.getenv('TRANSCRIPT_PROVIDER') or '').strip().lower()
+        if default_transcript_provider not in TRANSCRIPT_PROVIDERS:
+            default_transcript_provider = 'google'
+        self.transcript_provider_label = tk.StringVar(value=TRANSCRIPT_KEY_TO_LABEL[default_transcript_provider])
+        self.whisper_model = tk.StringVar(value=os.getenv('WHISPER_MODEL', 'large-v3-turbo'))
+        self.whisper_device = tk.StringVar(value=os.getenv('WHISPER_DEVICE', 'auto'))
+        self.whisper_compute_type = tk.StringVar(value=os.getenv('WHISPER_COMPUTE_TYPE', 'auto'))
+        self.gemma_model_id = tk.StringVar(value=os.getenv('GEMMA_MODEL_ID', 'google/gemma-4-E2B-it'))
+        self.gemma_device = tk.StringVar(value=os.getenv('GEMMA_DEVICE', 'auto'))
+        self.gemma_max_new_tokens = tk.StringVar(value=os.getenv('GEMMA_MAX_NEW_TOKENS', '512'))
+
         self.azure_endpoint = tk.StringVar(value=os.getenv('AZURE_OPENAI_ENDPOINT', ''))
         self.azure_deployment = tk.StringVar(value=os.getenv('AZURE_OPENAI_DEPLOYMENT', ''))
         self.azure_model_name = tk.StringVar(value=os.getenv('AZURE_OPENAI_MODEL_NAME', ''))
@@ -101,6 +123,8 @@ class VideoCompressorGUI:
         self.summary_widgets = []
         self.ai_azure_widgets = []
         self.ai_generic_widgets = []
+        self.transcript_whisper_widgets = []
+        self.transcript_gemma_widgets = []
 
         self.setup_styling()
         self.create_widgets()
@@ -143,6 +167,7 @@ class VideoCompressorGUI:
         """Keep derived UI state in sync with user input."""
         self.operation_mode.trace_add('write', self.on_operation_var_change)
         self.audio_codec.trace_add('write', self.on_audio_setting_change)
+        self.transcript_provider_label.trace_add('write', self.on_transcript_provider_var_change)
 
     def create_widgets(self):
         """Create the full UI."""
@@ -364,10 +389,23 @@ class VideoCompressorGUI:
         ttk.Label(body, textvariable=self.summary_detail_var, style='SummaryText.TLabel', wraplength=420, justify='left').grid(row=1, column=0, sticky='w', pady=(8, 0))
 
     def create_transcript_section(self, parent, row):
-        body, _ = self.create_card(parent, row, 'Transcription Settings', 'Configure transcript language for transcript-based workflows.')
+        body, _ = self.create_card(parent, row, 'Transcription Settings', 'Choose the speech-to-text engine and language.')
+        body.columnconfigure(1, weight=1)
+
+        engine_label = ttk.Label(body, text='Engine', style='Body.TLabel')
+        engine_label.grid(row=0, column=0, sticky='w', pady=(0, 10), padx=(0, 12))
+        engine_combo = ttk.Combobox(
+            body,
+            textvariable=self.transcript_provider_label,
+            values=[label for _, label in TRANSCRIPT_PROVIDER_LABELS],
+            state='readonly',
+            style='Modern.TCombobox',
+        )
+        engine_combo.grid(row=0, column=1, sticky='ew', pady=(0, 10))
+        engine_combo.bind('<<ComboboxSelected>>', lambda _e: self.on_transcript_provider_change())
 
         language_label = ttk.Label(body, text='Language', style='Body.TLabel')
-        language_label.grid(row=0, column=0, sticky='w', padx=(0, 12))
+        language_label.grid(row=1, column=0, sticky='w', pady=(0, 10), padx=(0, 12))
         language_combo = ttk.Combobox(
             body,
             textvariable=self.transcript_language,
@@ -375,10 +413,93 @@ class VideoCompressorGUI:
             state='readonly',
             style='Modern.TCombobox',
         )
-        language_combo.grid(row=0, column=1, sticky='w')
-        note = ttk.Label(body, text='The app extracts audio from video and transcribes it in fixed chunks for better reliability on long files.', style='Muted.TLabel', wraplength=420, justify='left')
-        note.grid(row=1, column=0, columnspan=2, sticky='w', pady=(10, 0))
-        self.transcript_widgets.extend([language_label, language_combo, note])
+        language_combo.grid(row=1, column=1, sticky='w', pady=(0, 10))
+
+        self.whisper_model_label = ttk.Label(body, text='Model', style='Body.TLabel')
+        self.whisper_model_combo = ttk.Combobox(
+            body,
+            textvariable=self.whisper_model,
+            values=['tiny', 'base', 'small', 'medium', 'large-v3', 'large-v3-turbo'],
+            state='readonly',
+            style='Modern.TCombobox',
+        )
+        self.whisper_device_label = ttk.Label(body, text='Device', style='Body.TLabel')
+        self.whisper_device_combo = ttk.Combobox(
+            body,
+            textvariable=self.whisper_device,
+            values=['auto', 'cpu', 'mps', 'cuda'],
+            state='readonly',
+            style='Modern.TCombobox',
+        )
+        self.whisper_compute_label = ttk.Label(body, text='Compute', style='Body.TLabel')
+        self.whisper_compute_combo = ttk.Combobox(
+            body,
+            textvariable=self.whisper_compute_type,
+            values=['auto', 'int8', 'float16'],
+            state='readonly',
+            style='Modern.TCombobox',
+        )
+        self.whisper_note = ttk.Label(
+            body,
+            text='First run downloads the selected Whisper model from HuggingFace.',
+            style='Muted.TLabel',
+            wraplength=420,
+            justify='left',
+        )
+        self.transcript_whisper_widgets = [
+            self.whisper_model_label,
+            self.whisper_model_combo,
+            self.whisper_device_label,
+            self.whisper_device_combo,
+            self.whisper_compute_label,
+            self.whisper_compute_combo,
+            self.whisper_note,
+        ]
+
+        self.gemma_model_label = ttk.Label(body, text='Model ID', style='Body.TLabel')
+        self.gemma_model_entry = ttk.Entry(body, textvariable=self.gemma_model_id, style='Modern.TEntry')
+        self.gemma_device_label = ttk.Label(body, text='Device', style='Body.TLabel')
+        self.gemma_device_combo = ttk.Combobox(
+            body,
+            textvariable=self.gemma_device,
+            values=['auto', 'cpu', 'mps', 'cuda'],
+            state='readonly',
+            style='Modern.TCombobox',
+        )
+        self.gemma_tokens_label = ttk.Label(body, text='Max tokens', style='Body.TLabel')
+        self.gemma_tokens_entry = ttk.Entry(body, textvariable=self.gemma_max_new_tokens, style='Modern.TEntry', width=10)
+        self.gemma_note = ttk.Label(
+            body,
+            text='First run downloads the Gemma model from HuggingFace. Audio is processed in 30-second chunks.',
+            style='Muted.TLabel',
+            wraplength=420,
+            justify='left',
+        )
+        self.transcript_gemma_widgets = [
+            self.gemma_model_label,
+            self.gemma_model_entry,
+            self.gemma_device_label,
+            self.gemma_device_combo,
+            self.gemma_tokens_label,
+            self.gemma_tokens_entry,
+            self.gemma_note,
+        ]
+
+        self.transcript_provider_note = ttk.Label(
+            body,
+            text='Google Speech Recognition uses the existing online chunked transcription path.',
+            style='Muted.TLabel',
+            wraplength=420,
+            justify='left',
+        )
+        self.transcript_provider_note.grid(row=2, column=0, columnspan=2, sticky='w', pady=(4, 0))
+
+        self.transcript_widgets.extend(
+            [engine_label, engine_combo, language_label, language_combo, self.transcript_provider_note]
+            + self.transcript_whisper_widgets
+            + self.transcript_gemma_widgets
+        )
+        self.on_transcript_provider_change()
 
     def create_ai_provider_section(self, parent, row):
         body, _ = self.create_card(parent, row, 'AI Summarization Provider',
@@ -437,6 +558,42 @@ class VideoCompressorGUI:
         self.summary_widgets.append(self.ai_provider_note)
 
         self.on_ai_provider_change()
+
+    def on_transcript_provider_var_change(self, *args):
+        self.on_transcript_provider_change()
+
+    def on_transcript_provider_change(self):
+        provider = TRANSCRIPT_LABEL_TO_KEY.get(self.transcript_provider_label.get(), 'google')
+
+        for widget in self.transcript_whisper_widgets + self.transcript_gemma_widgets:
+            widget.grid_remove()
+
+        self.transcript_provider_note.grid_remove()
+
+        if provider == 'faster_whisper':
+            rows = [
+                (self.whisper_model_label, self.whisper_model_combo),
+                (self.whisper_device_label, self.whisper_device_combo),
+                (self.whisper_compute_label, self.whisper_compute_combo),
+            ]
+            for index, (label, field) in enumerate(rows, start=2):
+                label.grid(row=index, column=0, sticky='w', pady=(0, 10), padx=(0, 12))
+                field.grid(row=index, column=1, sticky='ew' if field is self.whisper_model_combo else 'w', pady=(0, 10))
+            self.whisper_note.grid(row=5, column=0, columnspan=2, sticky='w', pady=(2, 0))
+        elif provider == 'gemma4_local':
+            rows = [
+                (self.gemma_model_label, self.gemma_model_entry),
+                (self.gemma_device_label, self.gemma_device_combo),
+                (self.gemma_tokens_label, self.gemma_tokens_entry),
+            ]
+            for index, (label, field) in enumerate(rows, start=2):
+                label.grid(row=index, column=0, sticky='w', pady=(0, 10), padx=(0, 12))
+                field.grid(row=index, column=1, sticky='ew' if field is self.gemma_model_entry else 'w', pady=(0, 10))
+            self.gemma_note.grid(row=5, column=0, columnspan=2, sticky='w', pady=(2, 0))
+        else:
+            self.transcript_provider_note.grid(row=2, column=0, columnspan=2, sticky='w', pady=(4, 0))
+
+        self.update_summary()
 
     def on_ai_provider_change(self):
         provider = AI_LABEL_TO_KEY.get(self.ai_provider_label.get(), 'azure')
@@ -783,6 +940,13 @@ class VideoCompressorGUI:
         if mode in {'transcript', 'transcript_summary'} and not self.transcript_file.get():
             return 'Please select a transcript output file.'
 
+        if mode in {'transcript', 'transcript_summary'}:
+            try:
+                transcript_config = self._build_transcript_config()
+                _validate_transcript_config(transcript_config)
+            except ValueError as exc:
+                return str(exc)
+
         if mode == 'transcript_summary':
             if not self.summary_file.get():
                 return 'Please select a summary output file.'
@@ -793,6 +957,19 @@ class VideoCompressorGUI:
                 return str(exc)
 
         return None
+
+    def _build_transcript_config(self):
+        provider = TRANSCRIPT_LABEL_TO_KEY.get(self.transcript_provider_label.get(), 'google')
+        return resolve_transcript_config(
+            provider,
+            language=self.transcript_language.get(),
+            whisper_model=self.whisper_model.get(),
+            whisper_device=self.whisper_device.get(),
+            whisper_compute_type=self.whisper_compute_type.get(),
+            gemma_model_id=self.gemma_model_id.get(),
+            gemma_device=self.gemma_device.get(),
+            gemma_max_new_tokens=self.gemma_max_new_tokens.get(),
+        )
 
     def _build_ai_config(self):
         provider = AI_LABEL_TO_KEY.get(self.ai_provider_label.get(), 'azure')
@@ -873,13 +1050,19 @@ class VideoCompressorGUI:
                 return
 
             self.status_var.set('Generating transcript...')
-            self.log_message('Starting transcription from video...')
+            transcript_config = self._build_transcript_config()
+            provider_label = self.transcript_provider_label.get() or TRANSCRIPT_KEY_TO_LABEL.get(
+                transcript_config['provider'],
+                transcript_config['provider'],
+            )
+            self.log_message(f'Starting transcription from video with {provider_label}...')
             self.progress_var.set(40)
 
             transcript_text = generate_transcript(
                 input_file=input_file,
                 output_file=self.transcript_file.get(),
                 language=self.transcript_language.get(),
+                transcript_config=transcript_config,
             )
             if not transcript_text:
                 raise RuntimeError('Transcript generation failed')
@@ -963,6 +1146,16 @@ class VideoCompressorGUI:
         self.audio_codec.set('mp3')
         self.audio_bitrate.set('128k')
         self.transcript_language.set('en-US')
+        default_transcript_provider = (os.getenv('TRANSCRIPT_PROVIDER') or '').strip().lower()
+        if default_transcript_provider not in TRANSCRIPT_PROVIDERS:
+            default_transcript_provider = 'google'
+        self.transcript_provider_label.set(TRANSCRIPT_KEY_TO_LABEL[default_transcript_provider])
+        self.whisper_model.set(os.getenv('WHISPER_MODEL', 'large-v3-turbo'))
+        self.whisper_device.set(os.getenv('WHISPER_DEVICE', 'auto'))
+        self.whisper_compute_type.set(os.getenv('WHISPER_COMPUTE_TYPE', 'auto'))
+        self.gemma_model_id.set(os.getenv('GEMMA_MODEL_ID', 'google/gemma-4-E2B-it'))
+        self.gemma_device.set(os.getenv('GEMMA_DEVICE', 'auto'))
+        self.gemma_max_new_tokens.set(os.getenv('GEMMA_MAX_NEW_TOKENS', '512'))
         self.azure_endpoint.set(os.getenv('AZURE_OPENAI_ENDPOINT', ''))
         self.azure_deployment.set(os.getenv('AZURE_OPENAI_DEPLOYMENT', ''))
         self.azure_model_name.set(os.getenv('AZURE_OPENAI_MODEL_NAME', ''))
@@ -975,6 +1168,7 @@ class VideoCompressorGUI:
         self.ai_base_url.set(os.getenv('AI_BASE_URL', ''))
         self.ai_model.set(os.getenv('AI_MODEL', ''))
         self.ai_api_key.set(os.getenv('AI_API_KEY', ''))
+        self.on_transcript_provider_change()
         self.on_ai_provider_change()
         self.progress_var.set(0)
         self.clear_log()
