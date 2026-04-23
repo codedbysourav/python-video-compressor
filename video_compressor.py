@@ -6,6 +6,12 @@ Also includes transcript generation functionality using speech recognition.
 """
 
 import os
+
+# PyTorch 2.6 changed torch.load default to weights_only=True, breaking older model checkpoints.
+# This env var restores the previous behavior for pyannote.audio compatibility.
+if os.getenv('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD') is None:
+    os.environ['TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD'] = '1'
+
 import sys
 import argparse
 import json
@@ -352,6 +358,8 @@ _TRANSCRIPT_PROVIDER_DEFAULTS = {
         'whisper_model': 'large-v3-turbo',
         'whisper_device': 'auto',
         'whisper_compute_type': 'auto',
+        'include_timestamps': False,
+        'diarization': False,
     },
     'gemma4_local': {
         'gemma_model_id': 'google/gemma-4-E2B-it',
@@ -367,6 +375,8 @@ _GEMMA_MODELS = {}
 def resolve_transcript_config(provider='google', language='en-US',
                               whisper_model=None, whisper_device=None,
                               whisper_compute_type=None,
+                              include_timestamps=None,
+                              diarization=None,
                               gemma_model_id=None, gemma_device=None,
                               gemma_max_new_tokens=None):
     """Build a normalized transcript_config dict, filling preset defaults."""
@@ -385,6 +395,8 @@ def resolve_transcript_config(provider='google', language='en-US',
             'whisper_model': (whisper_model or defaults['whisper_model']).strip(),
             'whisper_device': (whisper_device or defaults['whisper_device']).strip().lower(),
             'whisper_compute_type': (whisper_compute_type or defaults['whisper_compute_type']).strip().lower(),
+            'include_timestamps': bool(include_timestamps) if include_timestamps is not None else defaults['include_timestamps'],
+            'diarization': bool(diarization) if diarization is not None else defaults['diarization'],
         })
     elif provider == 'gemma4_local':
         defaults = _TRANSCRIPT_PROVIDER_DEFAULTS['gemma4_local']
@@ -676,6 +688,8 @@ def _coerce_transcript_config(transcript_config, language):
         whisper_model=transcript_config.get('whisper_model'),
         whisper_device=transcript_config.get('whisper_device'),
         whisper_compute_type=transcript_config.get('whisper_compute_type'),
+        include_timestamps=transcript_config.get('include_timestamps'),
+        diarization=transcript_config.get('diarization'),
         gemma_model_id=transcript_config.get('gemma_model_id'),
         gemma_device=transcript_config.get('gemma_device'),
         gemma_max_new_tokens=transcript_config.get('gemma_max_new_tokens'),
@@ -758,6 +772,94 @@ def _transcribe_google(audio_wav_path, language):
     return _transcribe_wav_in_chunks(audio_wav_path, normalized_language, recognizer)
 
 
+def _format_timestamp(seconds):
+    """Format seconds as HH:MM:SS or MM:SS."""
+    seconds = int(seconds)
+    hrs = seconds // 3600
+    mins = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hrs > 0:
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def _run_pyannote_diarization(audio_wav_path):
+    """Run pyannote.audio speaker diarization and return list of (start, end, speaker)."""
+    try:
+        from pyannote.audio import Pipeline
+    except ImportError as exc:
+        raise RuntimeError(
+            'Speaker diarization requires pyannote.audio. Install with: '
+            'pip install pyannote.audio'
+        ) from exc
+
+    hf_token = os.getenv('HF_TOKEN') or os.getenv('HUGGINGFACE_TOKEN') or os.getenv('HUGGING_FACE_HUB_TOKEN')
+
+    print("🎤 Running speaker diarization (this may take a while)...")
+    try:
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=hf_token,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            'Failed to load pyannote diarization model. Ensure you have accepted '
+            'the model license on HuggingFace and set HF_TOKEN if needed.'
+        ) from exc
+
+    diarization = pipeline(audio_wav_path)
+    speaker_segments = []
+    for turn, _, speaker in diarization.itertracks(yield_label=True):
+        speaker_segments.append((turn.start, turn.end, speaker))
+    return speaker_segments
+
+
+def _assign_speakers_to_segments(whisper_segments, speaker_segments):
+    """Assign a speaker label to each whisper segment by overlap."""
+    results = []
+    for seg in whisper_segments:
+        seg_start = getattr(seg, 'start', 0)
+        seg_end = getattr(seg, 'end', seg_start)
+        seg_text = getattr(seg, 'text', '').strip()
+        if not seg_text:
+            continue
+
+        best_speaker = "UNKNOWN"
+        best_overlap = 0.0
+        for spk_start, spk_end, speaker in speaker_segments:
+            overlap_start = max(seg_start, spk_start)
+            overlap_end = min(seg_end, spk_end)
+            overlap = max(0.0, overlap_end - overlap_start)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = speaker
+
+        results.append((seg_start, seg_end, best_speaker, seg_text))
+    return results
+
+
+def _format_transcript_segments(segments, include_timestamps=False, diarization=False):
+    """Format whisper segments into transcript text."""
+    if not segments:
+        return None
+
+    lines = []
+    for item in segments:
+        if diarization and include_timestamps:
+            start, end, speaker, text = item
+            lines.append(f"[{_format_timestamp(start)} - {_format_timestamp(end)}] {speaker}: {text}")
+        elif diarization:
+            start, end, speaker, text = item
+            lines.append(f"{speaker}: {text}")
+        elif include_timestamps:
+            start, end, text = item
+            lines.append(f"[{_format_timestamp(start)} - {_format_timestamp(end)}] {text}")
+        else:
+            lines.append(item)
+
+    return "\n".join(lines)
+
+
 def _transcribe_faster_whisper(audio_wav_path, cfg):
     """Transcribe a whole WAV with faster-whisper, loaded only when requested."""
     try:
@@ -782,7 +884,25 @@ def _transcribe_faster_whisper(audio_wav_path, cfg):
     language = _normalize_language(cfg['language'], 'faster_whisper')
     print("🎤 Transcribing with faster-whisper...")
     segments, _info = model.transcribe(audio_wav_path, language=language, vad_filter=True)
-    parts = [segment.text.strip() for segment in segments if getattr(segment, 'text', '').strip()]
+    whisper_segments = list(segments)
+
+    if not whisper_segments:
+        return None
+
+    include_timestamps = cfg.get('include_timestamps', False)
+    diarization = cfg.get('diarization', False)
+
+    if diarization:
+        speaker_segments = _run_pyannote_diarization(audio_wav_path)
+        merged = _assign_speakers_to_segments(whisper_segments, speaker_segments)
+        return _format_transcript_segments(merged, include_timestamps=include_timestamps, diarization=True)
+
+    if include_timestamps:
+        simple = [(getattr(s, 'start', 0), getattr(s, 'end', 0), getattr(s, 'text', '').strip()) for s in whisper_segments]
+        simple = [s for s in simple if s[2]]
+        return _format_transcript_segments(simple, include_timestamps=True)
+
+    parts = [segment.text.strip() for segment in whisper_segments if getattr(segment, 'text', '').strip()]
     return ' '.join(parts) if parts else None
 
 
@@ -1155,6 +1275,12 @@ Examples:
                        help='faster-whisper device (default: auto)')
     parser.add_argument('--whisper-compute-type', default=os.getenv('WHISPER_COMPUTE_TYPE', 'auto'),
                        help='faster-whisper compute type (default: auto)')
+    parser.add_argument('--include-timestamps', action='store_true',
+                       default=os.getenv('INCLUDE_TIMESTAMPS', '').lower() in ('1', 'true', 'yes'),
+                       help='Include timestamps in faster-whisper transcript output')
+    parser.add_argument('--diarization', action='store_true',
+                       default=os.getenv('DIARIZATION', '').lower() in ('1', 'true', 'yes'),
+                       help='Enable speaker diarization (faster-whisper only; requires pyannote.audio)')
     parser.add_argument('--gemma-model', default=os.getenv('GEMMA_MODEL_ID', 'google/gemma-4-E2B-it'),
                        help='Gemma local model ID (default: google/gemma-4-E2B-it)')
     parser.add_argument('--gemma-device', default=os.getenv('GEMMA_DEVICE', 'auto'),
@@ -1215,6 +1341,8 @@ Examples:
             whisper_model=args.whisper_model,
             whisper_device=args.whisper_device,
             whisper_compute_type=args.whisper_compute_type,
+            include_timestamps=args.include_timestamps,
+            diarization=args.diarization,
             gemma_model_id=args.gemma_model,
             gemma_device=args.gemma_device,
             gemma_max_new_tokens=args.gemma_max_new_tokens,

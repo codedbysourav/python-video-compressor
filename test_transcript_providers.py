@@ -25,6 +25,8 @@ class ResolveTranscriptConfigTest(unittest.TestCase):
         self.assertEqual(cfg['whisper_model'], 'large-v3-turbo')
         self.assertEqual(cfg['whisper_device'], 'auto')
         self.assertEqual(cfg['whisper_compute_type'], 'auto')
+        self.assertEqual(cfg['include_timestamps'], False)
+        self.assertEqual(cfg['diarization'], False)
 
     def test_gemma_defaults(self):
         cfg = vc.resolve_transcript_config('gemma4_local', language='fr-FR')
@@ -88,6 +90,49 @@ class GenerateTranscriptDispatchTest(unittest.TestCase):
         self.assertEqual(result, 'local transcript')
         transcribe.assert_called_once()
         self.assertEqual(transcribe.call_args.args[1]['whisper_model'], 'small')
+        self.assertEqual(transcribe.call_args.args[1]['include_timestamps'], False)
+
+
+class FormatTimestampTest(unittest.TestCase):
+    def test_under_one_minute(self):
+        self.assertEqual(vc._format_timestamp(45), '00:45')
+
+    def test_over_one_hour(self):
+        self.assertEqual(vc._format_timestamp(3665), '01:01:05')
+
+
+class FormatTranscriptSegmentsTest(unittest.TestCase):
+    def test_plain_text(self):
+        segments = ['Hello world.', 'Second sentence.']
+        result = vc._format_transcript_segments(segments)
+        self.assertEqual(result, 'Hello world.\nSecond sentence.')
+
+    def test_with_timestamps(self):
+        segments = [(0.0, 5.5, 'Hello'), (6.0, 10.0, 'World')]
+        result = vc._format_transcript_segments(segments, include_timestamps=True)
+        self.assertEqual(result, '[00:00 - 00:05] Hello\n[00:06 - 00:10] World')
+
+    def test_with_diarization_and_timestamps(self):
+        segments = [(0.0, 5.5, 'SPEAKER_00', 'Hello'), (6.0, 10.0, 'SPEAKER_01', 'World')]
+        result = vc._format_transcript_segments(segments, include_timestamps=True, diarization=True)
+        self.assertEqual(result, '[00:00 - 00:05] SPEAKER_00: Hello\n[00:06 - 00:10] SPEAKER_01: World')
+
+    def test_empty_segments(self):
+        self.assertIsNone(vc._format_transcript_segments([]))
+
+
+class AssignSpeakersToSegmentsTest(unittest.TestCase):
+    def test_basic_assignment(self):
+        whisper = [type('Seg', (), {'start': 1.0, 'end': 4.0, 'text': ' hello '})()]
+        speakers = [(0.0, 5.0, 'SPEAKER_A')]
+        result = vc._assign_speakers_to_segments(whisper, speakers)
+        self.assertEqual(result, [(1.0, 4.0, 'SPEAKER_A', 'hello')])
+
+    def test_overlap_picks_best(self):
+        whisper = [type('Seg', (), {'start': 2.0, 'end': 8.0, 'text': 'x'})()]
+        speakers = [(0.0, 3.0, 'A'), (3.0, 10.0, 'B')]
+        result = vc._assign_speakers_to_segments(whisper, speakers)
+        self.assertEqual(result[0][2], 'B')
 
 
 if __name__ == '__main__':
